@@ -1,0 +1,9 @@
+{
+  "id": "freelancer",
+  "name": "Freelancer",
+  "version": "0.1.0",
+  "description": "Find work requests in your vault and turn them into branded PDF quotes",
+  "apiVersion": 1,
+  "icon": "briefcase",
+  "entry": { "main": "dist/main.cjs", "renderer": "dist/renderer.mjs" }
+}
