@@ -226,3 +226,27 @@ test('draft attaches clientId when CRM has an exact match', async () => {
   const draft = await w.handlers['quotes:draft']({ notePath: '00-inbox/mail-acme.md' });
   assert.equal(draft.clientId, client.id);
 });
+
+async function generateQuote(w) {
+  w.llmResponses.push({ items: [{ title: 'Portal', client: 'ACME', ask: 'x', sourceNote: '00-inbox/mail-acme.md', confidence: 0.9 }] });
+  await w.handlers['quotes:sweep']({});
+  await w.handlers['quotes:generate']({
+    client: 'ACME', project: 'Portal', scopeSummary: 's',
+    lineItems: [{ description: 'dev', hours: 2, rate: 'default' }], assumptions: [], sourceNote: '00-inbox/mail-acme.md',
+  });
+  const [row] = await w.handlers['quotes:list']();
+  return row;
+}
+
+test('quote status walks draft -> sent -> accepted and rejects bad moves', async () => {
+  const w = makeWorld();
+  const row = await generateQuote(w);
+  assert.equal(row.status, 'draft');
+  await w.handlers['quotes:set-status']({ file: row.file, status: 'sent' });
+  await assert.rejects(w.handlers['quotes:set-status']({ file: row.file, status: 'draft' }), /invalid transition/);
+  await w.handlers['quotes:set-status']({ file: row.file, status: 'accepted' });
+  const [after] = await w.handlers['quotes:list']();
+  assert.equal(after.status, 'accepted');
+  await assert.rejects(w.handlers['quotes:set-status']({ file: row.file, status: 'sent' }), /invalid transition/);
+  await assert.rejects(w.handlers['quotes:set-status']({ file: '../evil.md', status: 'sent' }), /basename|invalid/i);
+});

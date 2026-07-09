@@ -7,6 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { mergeSweep, itemId, parseStrictJson, quoteBasename } = require('./lib/quotes.cjs');
 const { renderQuoteHtml, quoteMarkdown } = require('./lib/template.cjs');
+const { parseFrontmatter, setFrontmatterField, QUOTE_TRANSITIONS, INVOICE_TRANSITIONS, assertTransition, isOverdue } = require('./lib/lifecycle.cjs');
 const {
   emptyStore,
   matchClients,
@@ -240,7 +241,25 @@ ${blocks}`,
       }));
   }
 
+  async function rewriteStatus(dir, file, status, table, extraFields = {}) {
+    if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
+      throw new Error('file must be a note basename');
+    }
+    const full = path.join(dir, file);
+    const text = await fsp.readFile(full, 'utf-8');
+    const from = parseFrontmatter(text).fields.status || 'draft';
+    assertTransition(table, from, status);
+    let next = setFrontmatterField(text, 'status', status);
+    for (const [k, v] of Object.entries(extraFields)) next = setFrontmatterField(next, k, v);
+    const tmp = `${full}.tmp`;
+    await fsp.writeFile(tmp, next);
+    await fsp.rename(tmp, full);
+    return { ok: true, status };
+  }
+
   return {
+    'quotes:set-status': async ({ file, status } = {}) => rewriteStatus(quotesDir(), file, status, QUOTE_TRANSITIONS),
+
     'quotes:sweep': async (opts = {}) => {
       const cache = await readCache();
       const notes = await candidateNotes();
@@ -397,6 +416,8 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
           currency: get('currency'),
           generated: get('generated'),
           pdf: files.includes(f.replace(/\.md$/, '.pdf')),
+          status: get('status') || 'draft',
+          invoiced: get('invoiced') === 'true',
         });
       }
       return out;
