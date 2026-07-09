@@ -109,9 +109,16 @@ async function renderPdfElectron(html) {
   }
 }
 
+/** shell.openPath resolves to '' on success, or a human-readable error string. */
+async function electronOpenPath(p) {
+  const { shell } = require('electron');
+  return shell.openPath(p);
+}
+
 /** Exported for tests: build the handler map from a ctx + injectable deps. */
 function createHandlers(ctx, deps = {}) {
   const renderPdf = deps.renderPdf ?? renderPdfElectron;
+  const openPath = deps.openPath ?? electronOpenPath;
   const now = deps.now ?? (() => new Date());
   const sweepMaxNotes = deps.sweepMaxNotes ?? SWEEP_MAX_NOTES;
   const cachePath = path.join(ctx.dataDir, 'work-items.json');
@@ -338,6 +345,13 @@ ${blocks}`,
       return run;
     },
 
+    // Cheap cache read: no LLM, no vault scan. Populates the tab instantly on
+    // mount; quotes:sweep (the sweep button) is the only thing that refreshes it.
+    'quotes:items': async () => {
+      const cache = await readCache();
+      return { items: cache.items };
+    },
+
     'quotes:dismiss': async (id) => {
       if (typeof id !== 'string' || !id) throw new Error('dismiss needs an item id');
       const cache = await readCache();
@@ -477,6 +491,71 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
         });
       }
       return out;
+    },
+
+    // Open a quote's note or pdf sibling by basename — same guard idiom as
+    // quotes:set-status (basename-only, must resolve inside quotesDir).
+    'quotes:open': async ({ file, which } = {}) => {
+      if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
+        throw new Error('file must be a note basename');
+      }
+      const target = which === 'pdf' ? file.replace(/\.md$/, '.pdf') : file;
+      const full = path.join(quotesDir(), target);
+      if (!path.resolve(full).startsWith(path.resolve(quotesDir()))) throw new Error('path escapes the vault');
+      const err = await openPath(full);
+      if (err) throw new Error(err);
+      return { ok: true };
+    },
+
+    'quotes:load': async ({ file } = {}) => {
+      if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
+        throw new Error('file must be a note basename');
+      }
+      const full = path.join(quotesDir(), file);
+      if (!path.resolve(full).startsWith(path.resolve(quotesDir()))) throw new Error('path escapes the vault');
+      const text = await fsp.readFile(full, 'utf-8');
+      const { fields } = parseFrontmatter(text);
+      const data = parseDataComment(text);
+      const lineItems = data?.lineItems ?? [];
+      // Old notes (pre data-comment-richer-payload) only carry lineItems in the
+      // comment, or none at all — recover scope/assumptions from the markdown
+      // sections quoteMarkdown always writes.
+      let scopeSummary = data?.scopeSummary;
+      if (scopeSummary === undefined) {
+        scopeSummary = text.match(/## Scope\n\n([\s\S]*?)\n\n## /)?.[1] ?? '';
+      }
+      let assumptions = data?.assumptions;
+      if (assumptions === undefined) {
+        const block = text.match(/## Assumptions\n\n([\s\S]*?)\n\n## /)?.[1] ?? '';
+        assumptions = block
+          .split('\n')
+          .map((l) => l.replace(/^-\s*/, '').trim())
+          .filter(Boolean);
+      }
+      return {
+        client: fields.client ?? '',
+        clientId: fields.clientId || null,
+        project: fields.project ?? '',
+        status: fields.status || 'draft',
+        invoiced: fields.invoiced === 'true',
+        sourceNote: fields.source ?? '',
+        lineItems,
+        scopeSummary,
+        assumptions,
+      };
+    },
+
+    /* ---------- files ---------- */
+
+    // Open an ABSOLUTE path (e.g. the pdfPath just returned by quotes:generate)
+    // via the OS file handler; guarded to stay inside the vault.
+    'files:open': async (absPath) => {
+      if (typeof absPath !== 'string' || !absPath) throw new Error('open needs an absolute path');
+      const resolved = path.resolve(absPath);
+      if (!resolved.startsWith(path.resolve(vaultDir()))) throw new Error('path escapes the vault');
+      const err = await openPath(resolved);
+      if (err) throw new Error(err);
+      return { ok: true };
     },
 
     /* ---------- invoices ---------- */

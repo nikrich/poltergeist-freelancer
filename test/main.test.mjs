@@ -51,15 +51,20 @@ function makeWorld(extraDeps = {}) {
   };
 
   const pdfCalls = [];
+  const openCalls = [];
   const handlers = createHandlers(ctx, {
     renderPdf: async (html) => {
       pdfCalls.push(html);
       return Buffer.from('%PDF-fake');
     },
     now: () => new Date('2026-07-09T12:00:00Z'),
+    openPath: async (p) => {
+      openCalls.push(p);
+      return '';
+    },
     ...extraDeps,
   });
-  return { handlers, llmResponses, sent, pdfCalls, vault, dataDir, settings };
+  return { handlers, llmResponses, sent, pdfCalls, openCalls, vault, dataDir, settings };
 }
 
 // Seeds `total` markdown notes in 00-inbox with distinct, controlled mtimes so
@@ -525,4 +530,127 @@ test('a dismiss landing between two sweep batches survives — the dismissed ite
   const finalCache = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
   assert.ok(finalCache.dismissed.includes(dismissedId), 'dismissal must still be recorded after the final batch write');
   assert.ok(!finalCache.items.some((i) => i.id === dismissedId), 'dismissed item must not reappear in the persisted cache');
+});
+
+test('quotes:items reads the cache without sweeping (no llm call), reflects a prior sweep', async () => {
+  const w = makeWorld();
+  const fresh = await w.handlers['quotes:items']();
+  assert.deepEqual(fresh, { items: [] });
+
+  w.llmResponses.push({
+    items: [{ title: 'Booking portal', client: 'ACME GmbH', ask: 'Build a small booking portal', sourceNote: '00-inbox/mail-acme.md', confidence: 0.9 }],
+  });
+  await w.handlers['quotes:sweep']({});
+
+  // no llm response queued — quotes:items must not call the llm at all
+  const after = await w.handlers['quotes:items']();
+  assert.equal(after.items.length, 1);
+  assert.equal(after.items[0].client, 'ACME GmbH');
+});
+
+test('files:open rejects paths outside the vault and delegates in-vault paths to the injected opener', async () => {
+  const w = makeWorld();
+  await assert.rejects(w.handlers['files:open']('/etc/passwd'), /vault/);
+  assert.equal(w.openCalls.length, 0);
+
+  const inVault = join(w.vault, '30-cross-context', 'quotes', 'x.pdf');
+  const res = await w.handlers['files:open'](inVault);
+  assert.equal(res.ok, true);
+  assert.deepEqual(w.openCalls, [inVault]);
+});
+
+test('files:open throws when the opener reports a non-empty error string', async () => {
+  const w = makeWorld({ openPath: async () => 'no application found' });
+  const inVault = join(w.vault, '30-cross-context', 'quotes', 'x.pdf');
+  await assert.rejects(w.handlers['files:open'](inVault), /no application found/);
+});
+
+test('quotes:open resolves pdf/note siblings inside quotesDir and rejects basename traversal', async () => {
+  const w = makeWorld();
+  const quote = {
+    client: 'ACME', project: 'P', scopeSummary: 's',
+    lineItems: [{ description: 'dev', hours: 1, rate: 'default' }], assumptions: [], sourceNote: '00-inbox/mail-acme.md',
+  };
+  const { notePath } = await w.handlers['quotes:generate'](quote);
+  const file = notePath.split('/').pop();
+
+  await w.handlers['quotes:open']({ file, which: 'note' });
+  assert.equal(w.openCalls[0], notePath);
+
+  await w.handlers['quotes:open']({ file, which: 'pdf' });
+  assert.equal(w.openCalls[1], notePath.replace(/\.md$/, '.pdf'));
+
+  await assert.rejects(w.handlers['quotes:open']({ file: '../../evil.md', which: 'note' }), /basename|invalid/i);
+});
+
+test('quotes:load round-trips a generated quote (client/project/scope/lineItems/assumptions)', async () => {
+  const w = makeWorld();
+  const quote = {
+    client: 'ACME GmbH', project: 'Booking portal', scopeSummary: 'Build a small booking portal',
+    lineItems: [{ description: 'backend', hours: 20, rate: 'development' }],
+    assumptions: ['hosting provided'], sourceNote: '00-inbox/mail-acme.md',
+  };
+  const { notePath } = await w.handlers['quotes:generate'](quote);
+  const file = notePath.split('/').pop();
+
+  const loaded = await w.handlers['quotes:load']({ file });
+  assert.equal(loaded.client, 'ACME GmbH');
+  assert.equal(loaded.project, 'Booking portal');
+  assert.equal(loaded.scopeSummary, 'Build a small booking portal');
+  assert.deepEqual(loaded.lineItems, quote.lineItems);
+  assert.deepEqual(loaded.assumptions, ['hosting provided']);
+  assert.equal(loaded.sourceNote, '00-inbox/mail-acme.md');
+  assert.equal(loaded.status, 'draft');
+  assert.equal(loaded.invoiced, false);
+
+  await assert.rejects(w.handlers['quotes:load']({ file: '../../evil.md' }), /basename|invalid/i);
+});
+
+test('quotes:load falls back to Scope/Assumptions markdown sections for old notes lacking the richer data comment', async () => {
+  const w = makeWorld();
+  const dir = join(w.vault, '30-cross-context', 'quotes');
+  mkdirSync(dir, { recursive: true });
+  const oldNote = `---
+client: "Old Co"
+project: "Legacy"
+total: 100
+currency: EUR
+status: draft
+source: "00-inbox/mail-acme.md"
+generated: 2020-01-01T00:00:00.000Z
+---
+
+# Quote — Old Co
+
+**Project:** Legacy
+
+## Scope
+
+Old scope text.
+
+## Line items
+
+| item | hours | rate | amount |
+|------|-------|------|--------|
+| dev | 1 | €80.00 | €80.00 |
+
+**Total: €80.00**
+
+## Assumptions
+
+- assumption one
+- assumption two
+
+## Terms
+
+net 14 — valid 14 days.
+
+<!-- freelancer:data {"lineItems":[{"description":"dev","hours":1,"rate":"default"}]} -->
+`;
+  writeFileSync(join(dir, 'old-quote.md'), oldNote);
+
+  const loaded = await w.handlers['quotes:load']({ file: 'old-quote.md' });
+  assert.equal(loaded.scopeSummary, 'Old scope text.');
+  assert.deepEqual(loaded.assumptions, ['assumption one', 'assumption two']);
+  assert.deepEqual(loaded.lineItems, [{ description: 'dev', hours: 1, rate: 'default' }]);
 });

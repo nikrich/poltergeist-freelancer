@@ -195,7 +195,7 @@ ${(quote.assumptions ?? []).map((a) => `- ${a}`).join('\n')}
 
 ${terms} — valid ${Number(brand.validityDays) || 14} days.
 
-${dataComment({ lineItems: quote.lineItems ?? [] })}
+${dataComment({ lineItems: quote.lineItems ?? [], scopeSummary: quote.scopeSummary ?? '', assumptions: quote.assumptions ?? [] })}
 `;
 }
 
