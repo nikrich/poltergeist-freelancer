@@ -30,9 +30,14 @@ function WorkItems({ api, s, onQuote }) {
 
   useEffect(() => {
     const off = api.ipc.on('quotes:sweep-progress', (p) => setProgress(p));
-    void sweep(false);
+    // Cheap cache read — no LLM, no vault scan. The sweep button is the only
+    // thing that triggers quotes:sweep; a tab visit must never cost an LLM pass.
+    api.ipc
+      .invoke('quotes:items')
+      .then((res) => setItems(res.items))
+      .catch((e) => setError(e.message));
     return off;
-  }, [api, sweep]);
+  }, [api]);
 
   const dismiss = async (id) => {
     try {
@@ -127,9 +132,16 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
   const [result, setResult] = useState(null);
   const rates = config?.rates ?? { currency: 'EUR', default: 0, named: [] };
   const rateNames = useMemo(() => ['default', ...rates.named.map((r) => r.name)], [rates]);
+  const allRatesZero = !rates.default && (rates.named ?? []).every((r) => !r.hourly);
 
   useEffect(() => {
     let alive = true;
+    // Editing an old quote: the caller already loaded it via quotes:load — drop
+    // it straight into the composer, no drafting LLM call needed.
+    if (draftRef?.prefill) {
+      setQuote(draftRef.prefill);
+      return;
+    }
     setBusy(true);
     api.ipc
       .invoke('quotes:draft', draftRef)
@@ -168,8 +180,13 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
   };
 
   if (result) {
+    const openPdf = () => {
+      setError('');
+      api.ipc.invoke('files:open', result.pdfPath).catch((e) => setError(e.message));
+    };
     return (
       <Panel title="quote generated" s={s}>
+        <ErrorBanner error={error} s={s} />
         <div style={{ fontSize: 13, color: s.ink0, marginBottom: 8 }}>
           {quote.client} — {formatMoney(total, rates.currency)}
         </div>
@@ -179,7 +196,7 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
           {result.notePath}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button style={btnStyle(s, true)} onClick={() => api.openExternal('file://' + result.pdfPath)}>open pdf</button>
+          <button style={btnStyle(s, true)} onClick={openPdf}>open pdf</button>
           <button style={btnStyle(s, false)} onClick={onDone}>done</button>
         </div>
       </Panel>
@@ -233,6 +250,11 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
         />
       </label>
 
+      {allRatesZero && (
+        <div style={{ fontSize: 11, color: s.oxblood, opacity: 0.75, marginBottom: 6 }}>
+          all amounts are €0 — set your hourly rates in settings → rates
+        </div>
+      )}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span style={{ fontSize: 15, fontWeight: 700, color: s.neon }}>{formatMoney(total, rates.currency)}</span>
         <button style={btnStyle(s, true)} disabled={busy} onClick={() => void generate()}>
@@ -243,7 +265,7 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
   );
 }
 
-function HistoryRow({ s, row, busy, onSetStatus, onConvert }) {
+function HistoryRow({ s, row, busy, onSetStatus, onConvert, onOpen, onEdit }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: `1px solid ${s.hairline}` }}>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -255,6 +277,11 @@ function HistoryRow({ s, row, busy, onSetStatus, onConvert }) {
           {formatMoney(row.total, row.currency || 'EUR')} · {(row.generated || '').slice(0, 10)}
         </div>
       </div>
+      {row.pdf && (
+        <Btn s={s} disabled={busy} onClick={() => onOpen('pdf')}>pdf</Btn>
+      )}
+      <Btn s={s} disabled={busy} onClick={() => onOpen('note')}>note</Btn>
+      <Btn s={s} disabled={busy} onClick={onEdit}>edit</Btn>
       <StatusPill s={s} status={row.status} />
       {row.status === 'draft' && (
         <Btn s={s} disabled={busy} onClick={() => onSetStatus('sent')}>mark sent</Btn>
@@ -276,7 +303,7 @@ function HistoryRow({ s, row, busy, onSetStatus, onConvert }) {
   );
 }
 
-function QuoteHistory({ api, s, history, onRefresh, setTab, setPendingInvoiceDraft }) {
+function QuoteHistory({ api, s, history, onRefresh, setTab, setPendingInvoiceDraft, onEdit }) {
   const [error, setError] = useState('');
   const [busyFile, setBusyFile] = useState(null);
 
@@ -307,6 +334,31 @@ function QuoteHistory({ api, s, history, onRefresh, setTab, setPendingInvoiceDra
     }
   };
 
+  const open = async (file, which) => {
+    setError('');
+    setBusyFile(file);
+    try {
+      await api.ipc.invoke('quotes:open', { file, which });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyFile(null);
+    }
+  };
+
+  const edit = async (file) => {
+    setError('');
+    setBusyFile(file);
+    try {
+      const loaded = await api.ipc.invoke('quotes:load', { file });
+      onEdit(loaded);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyFile(null);
+    }
+  };
+
   if (history.length === 0) return null;
 
   return (
@@ -320,6 +372,8 @@ function QuoteHistory({ api, s, history, onRefresh, setTab, setPendingInvoiceDra
           busy={busyFile === row.file}
           onSetStatus={(status) => void setStatus(row.file, status)}
           onConvert={() => void convert(row.file)}
+          onOpen={(which) => void open(row.file, which)}
+          onEdit={() => void edit(row.file)}
         />
       ))}
     </Panel>
@@ -366,7 +420,15 @@ export function QuotesTab({ api, s, config, setTab, setPendingInvoiceDraft }) {
   return (
     <>
       <WorkItems api={api} s={s} onQuote={setDraftRef} />
-      <QuoteHistory api={api} s={s} history={history} onRefresh={loadHistory} setTab={setTab} setPendingInvoiceDraft={setPendingInvoiceDraft} />
+      <QuoteHistory
+        api={api}
+        s={s}
+        history={history}
+        onRefresh={loadHistory}
+        setTab={setTab}
+        setPendingInvoiceDraft={setPendingInvoiceDraft}
+        onEdit={(loaded) => setDraftRef({ prefill: loaded })}
+      />
     </>
   );
 }

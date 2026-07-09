@@ -95,6 +95,13 @@ test('quoteMarkdown embeds the machine-readable line items', () => {
   assert.deepEqual(parseDataComment(md).lineItems, [{ description: 'dev', hours: 2, rate: 'default' }]);
 });
 
+test('quoteMarkdown data comment also carries scopeSummary and assumptions, for edit round-trip', () => {
+  const md = quoteMarkdown(quote, brand, rates);
+  const data = parseDataComment(md);
+  assert.equal(data.scopeSummary, quote.scopeSummary);
+  assert.deepEqual(data.assumptions, quote.assumptions);
+});
+
 const INVOICE = {
   number: 'INV-2026-007', client: 'Acme', project: 'Site',
   issued: '2026-07-09', due: '2026-07-23',
