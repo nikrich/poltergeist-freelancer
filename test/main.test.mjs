@@ -163,6 +163,17 @@ test('manual rejects paths escaping the vault; generate rejects empty quotes', a
   await assert.rejects(() => w.handlers['quotes:generate']({ client: 'x', lineItems: [] }), /line item/);
 });
 
+test('manual rejects a sibling directory whose name merely shares the vault path as a string prefix', async () => {
+  const w = makeWorld();
+  // vault is <root>/vault; <root>/vault-evil is a sibling, NOT inside the vault,
+  // but its path starts with the vault's path as a raw string.
+  const evilDir = `${w.vault}-evil`;
+  mkdirSync(evilDir, { recursive: true });
+  writeFileSync(join(evilDir, 'secret.pdf'), 'nope');
+  // reach it via a notePath that resolves outside the vault through '..'
+  await assert.rejects(() => w.handlers['quotes:manual']('../vault-evil/secret.pdf'), /vault/);
+});
+
 test('clients upsert list resolve archive and vault mirror', async () => {
   const w = makeWorld();
   const client = await w.handlers['clients:upsert']({
@@ -559,6 +570,19 @@ test('files:open rejects paths outside the vault and delegates in-vault paths to
   assert.deepEqual(w.openCalls, [inVault]);
 });
 
+test('files:open rejects a sibling directory whose name merely shares the vault path as a string prefix', async () => {
+  const w = makeWorld();
+  // vault is <root>/vault; <root>/vault-evil is a sibling, NOT inside the vault,
+  // but its path starts with the vault's path as a raw string — a naive
+  // startsWith(vaultDir) containment check would wrongly let this through.
+  const evilDir = `${w.vault}-evil`;
+  mkdirSync(evilDir, { recursive: true });
+  const evilFile = join(evilDir, 'secret.pdf');
+  writeFileSync(evilFile, 'nope');
+  await assert.rejects(w.handlers['files:open'](evilFile), /vault/);
+  assert.equal(w.openCalls.length, 0);
+});
+
 test('files:open throws when the opener reports a non-empty error string', async () => {
   const w = makeWorld({ openPath: async () => 'no application found' });
   const inVault = join(w.vault, '30-cross-context', 'quotes', 'x.pdf');
@@ -581,6 +605,19 @@ test('quotes:open resolves pdf/note siblings inside quotesDir and rejects basena
   assert.equal(w.openCalls[1], notePath.replace(/\.md$/, '.pdf'));
 
   await assert.rejects(w.handlers['quotes:open']({ file: '../../evil.md', which: 'note' }), /basename|invalid/i);
+});
+
+test('quotes:open rejects an unrecognized which value instead of silently opening the note', async () => {
+  const w = makeWorld();
+  const quote = {
+    client: 'ACME', project: 'P', scopeSummary: 's',
+    lineItems: [{ description: 'dev', hours: 1, rate: 'default' }], assumptions: [], sourceNote: '00-inbox/mail-acme.md',
+  };
+  const { notePath } = await w.handlers['quotes:generate'](quote);
+  const file = notePath.split('/').pop();
+
+  await assert.rejects(w.handlers['quotes:open']({ file, which: 'exe' }), /which must be/i);
+  assert.equal(w.openCalls.length, 0);
 });
 
 test('quotes:load round-trips a generated quote (client/project/scope/lineItems/assumptions)', async () => {

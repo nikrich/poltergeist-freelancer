@@ -117,6 +117,21 @@ async function electronOpenPath(p) {
 
 /** Exported for tests: build the handler map from a ctx + injectable deps. */
 function createHandlers(ctx, deps = {}) {
+  /**
+   * Segment-aware containment check: rejects any resolved path that isn't
+   * `dir` itself or a proper descendant of it. A bare `resolved.startsWith(root)`
+   * string check is bypassable by a sibling directory whose name happens to
+   * share `root` as a string prefix (e.g. root=/x/vault, sibling=/x/vault-evil).
+   */
+  function assertInside(dir, p) {
+    const resolved = path.resolve(p);
+    const root = path.resolve(dir);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new Error('path escapes the vault');
+    }
+    return resolved;
+  }
+
   const renderPdf = deps.renderPdf ?? renderPdfElectron;
   const openPath = deps.openPath ?? electronOpenPath;
   const now = deps.now ?? (() => new Date());
@@ -374,8 +389,7 @@ ${blocks}`,
 
     'quotes:manual': async (notePath) => {
       if (typeof notePath !== 'string' || !notePath) throw new Error('manual needs a note path');
-      const full = path.join(vaultDir(), notePath);
-      if (!path.resolve(full).startsWith(path.resolve(vaultDir()))) throw new Error('note path escapes the vault');
+      const full = assertInside(vaultDir(), path.join(vaultDir(), notePath));
       await fsp.access(full);
       const title = path.basename(notePath, '.md');
       return {
@@ -499,9 +513,11 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
         throw new Error('file must be a note basename');
       }
+      if (which !== 'pdf' && which !== 'note') {
+        throw new Error("which must be 'pdf' or 'note'");
+      }
       const target = which === 'pdf' ? file.replace(/\.md$/, '.pdf') : file;
-      const full = path.join(quotesDir(), target);
-      if (!path.resolve(full).startsWith(path.resolve(quotesDir()))) throw new Error('path escapes the vault');
+      const full = assertInside(quotesDir(), path.join(quotesDir(), target));
       const err = await openPath(full);
       if (err) throw new Error(err);
       return { ok: true };
@@ -511,8 +527,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
         throw new Error('file must be a note basename');
       }
-      const full = path.join(quotesDir(), file);
-      if (!path.resolve(full).startsWith(path.resolve(quotesDir()))) throw new Error('path escapes the vault');
+      const full = assertInside(quotesDir(), path.join(quotesDir(), file));
       const text = await fsp.readFile(full, 'utf-8');
       const { fields } = parseFrontmatter(text);
       const data = parseDataComment(text);
@@ -551,8 +566,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
     // via the OS file handler; guarded to stay inside the vault.
     'files:open': async (absPath) => {
       if (typeof absPath !== 'string' || !absPath) throw new Error('open needs an absolute path');
-      const resolved = path.resolve(absPath);
-      if (!resolved.startsWith(path.resolve(vaultDir()))) throw new Error('path escapes the vault');
+      const resolved = assertInside(vaultDir(), absPath);
       const err = await openPath(resolved);
       if (err) throw new Error(err);
       return { ok: true };
