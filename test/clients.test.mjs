@@ -161,3 +161,12 @@ test('primaryContact picks primary then first', () => {
   );
   assert.equal(primaryContact(c).name, 'B');
 });
+
+test('defaults accept a numeric vatRate and drop junk', () => {
+  const c = validateClient({ name: 'Acme', defaults: { currency: 'eur', vatRate: 15 } });
+  assert.equal(c.defaults.vatRate, 15);
+  assert.equal(c.defaults.currency, 'EUR');
+  const junk = validateClient({ name: 'Acme', defaults: { vatRate: 'abc' } });
+  assert.equal(junk.defaults.vatRate, undefined);
+  assert.throws(() => validateClient({ name: 'Acme', defaults: { vatRate: 120 } }), /vatRate/);
+});

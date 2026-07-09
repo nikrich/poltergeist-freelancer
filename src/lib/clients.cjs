@@ -80,10 +80,19 @@ function cleanBilling(b) {
 function cleanDefaults(d) {
   if (!d || typeof d !== 'object') return {};
   const currency = trimOrUndef(d.currency, 3);
+  let vatRate;
+  if (d.vatRate !== undefined && d.vatRate !== null && String(d.vatRate).trim() !== '') {
+    const n = Number(d.vatRate);
+    if (Number.isFinite(n)) {
+      if (n < 0 || n > 100) throw new Error(`vatRate must be 0-100, got ${n}`);
+      vatRate = n;
+    }
+  }
   return {
     currency: currency ? currency.toUpperCase() : undefined,
     rateName: trimOrUndef(d.rateName, 60),
     paymentTerms: trimOrUndef(d.paymentTerms, 200),
+    vatRate,
   };
 }
 
