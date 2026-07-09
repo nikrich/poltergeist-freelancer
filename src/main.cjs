@@ -7,6 +7,16 @@ const path = require('node:path');
 const os = require('node:os');
 const { mergeSweep, itemId, parseStrictJson, quoteBasename } = require('./lib/quotes.cjs');
 const { renderQuoteHtml, quoteMarkdown } = require('./lib/template.cjs');
+const {
+  emptyStore,
+  matchClients,
+  filterByStatus,
+  resolveClient,
+  mergeUpsert,
+  archiveClient,
+  bootstrapFromNames,
+  clientVaultNote,
+} = require('./lib/clients.cjs');
 
 const SWEEP_WINDOW_DAYS = 14;
 const EXCERPT_CHARS = 2000;
@@ -100,10 +110,12 @@ function createHandlers(ctx, deps = {}) {
   const renderPdf = deps.renderPdf ?? renderPdfElectron;
   const now = deps.now ?? (() => new Date());
   const cachePath = path.join(ctx.dataDir, 'work-items.json');
+  const clientsPath = path.join(ctx.dataDir, 'clients.json');
 
   const config = () => deepMerge(DEFAULT_CONFIG, ctx.settings.get('config') ?? {});
   const vaultDir = () => expandHome(config().vaultPath);
   const quotesDir = () => path.join(vaultDir(), '30-cross-context', 'quotes');
+  const clientsVaultDir = () => path.join(vaultDir(), '30-cross-context', 'clients');
 
   async function readCache() {
     try {
@@ -115,6 +127,39 @@ function createHandlers(ctx, deps = {}) {
   async function writeCache(cache) {
     await fsp.mkdir(ctx.dataDir, { recursive: true });
     await fsp.writeFile(cachePath, JSON.stringify(cache, null, 2));
+  }
+
+  async function readClients() {
+    try {
+      const raw = JSON.parse(await fsp.readFile(clientsPath, 'utf-8'));
+      if (!raw || !Array.isArray(raw.clients)) return emptyStore();
+      return { version: 1, clients: raw.clients };
+    } catch {
+      return emptyStore();
+    }
+  }
+  async function writeClients(store) {
+    await fsp.mkdir(ctx.dataDir, { recursive: true });
+    const tmp = `${clientsPath}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(store, null, 2));
+    await fsp.rename(tmp, clientsPath);
+  }
+
+  /** Best-effort vault card mirror; never fails the CRM write. */
+  async function mirrorClientNote(client) {
+    try {
+      const dir = clientsVaultDir();
+      await fsp.mkdir(dir, { recursive: true });
+      const { basename, markdown } = clientVaultNote(client);
+      await fsp.writeFile(path.join(dir, `${basename}.md`), markdown);
+    } catch (err) {
+      ctx.log('client vault mirror failed:', err.message);
+    }
+  }
+
+  async function findClient(id) {
+    const store = await readClients();
+    return store.clients.find((c) => c.id === id) ?? null;
   }
 
   async function walkMd(dir, out) {
@@ -280,7 +325,13 @@ Break the work into 2-8 concrete line items with realistic hour estimates.
 Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hours", "rate"}], "assumptions": [...]}.`,
         QUOTE_DRAFT_SCHEMA,
       );
-      return { ...draft, sourceNote };
+      const store = await readClients();
+      const { client: matched } = resolveClient(store.clients, draft.client);
+      return {
+        ...draft,
+        sourceNote,
+        clientId: matched?.id,
+      };
     },
 
     'quotes:generate': async (quote) => {
@@ -288,17 +339,31 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       if (!quote.client || !Array.isArray(quote.lineItems) || quote.lineItems.length === 0) {
         throw new Error('quote needs a client and at least one line item');
       }
-      const { brand, rates } = config();
-      const html = renderQuoteHtml(quote, brand, rates);
+      const { brand, rates: baseRates } = config();
+      let client = null;
+      if (quote.clientId) {
+        client = await findClient(quote.clientId);
+        if (!client) throw new Error(`unknown client: ${quote.clientId}`);
+      } else {
+        const store = await readClients();
+        client = resolveClient(store.clients, quote.client).client;
+      }
+      const rates = {
+        ...baseRates,
+        currency: client?.defaults?.currency || baseRates.currency,
+      };
+      if (client && !quote.clientId) quote = { ...quote, clientId: client.id };
+      const html = renderQuoteHtml(quote, brand, rates, client || undefined);
       const pdf = await renderPdf(html);
 
       const dir = quotesDir();
       await fsp.mkdir(dir, { recursive: true });
-      let base = quoteBasename(quote.client, now());
+      const nameForFile = client?.name || quote.client;
+      let base = quoteBasename(nameForFile, now());
       for (let n = 2; ; n++) {
         try {
           await fsp.access(path.join(dir, `${base}.md`));
-          base = `${quoteBasename(quote.client, now())}-${n}`;
+          base = `${quoteBasename(nameForFile, now())}-${n}`;
         } catch {
           break;
         }
@@ -306,9 +371,9 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       const notePath = path.join(dir, `${base}.md`);
       const pdfPath = path.join(dir, `${base}.pdf`);
       await fsp.writeFile(pdfPath, pdf);
-      await fsp.writeFile(notePath, quoteMarkdown(quote, brand, rates));
+      await fsp.writeFile(notePath, quoteMarkdown(quote, brand, rates, client || undefined));
       ctx.log('quote generated:', pdfPath);
-      return { pdfPath, notePath };
+      return { pdfPath, notePath, clientId: quote.clientId || client?.id || null };
     },
 
     'quotes:list': async () => {
@@ -326,6 +391,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
         out.push({
           file: f,
           client: get('client'),
+          clientId: get('clientId') || null,
           project: get('project'),
           total: Number(get('total')) || 0,
           currency: get('currency'),
@@ -334,6 +400,74 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
         });
       }
       return out;
+    },
+
+    /* ---------- clients CRM ---------- */
+
+    'clients:list': async (opts = {}) => {
+      const store = await readClients();
+      let list = filterByStatus(store.clients, opts.status ?? 'all');
+      if (opts.q) list = matchClients(list, opts.q);
+      return list.sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    'clients:get': async (id) => {
+      if (typeof id !== 'string' || !id) throw new Error('get needs a client id');
+      const client = await findClient(id);
+      if (!client) throw new Error(`unknown client: ${id}`);
+      return client;
+    },
+
+    'clients:upsert': async (payload) => {
+      const store = await readClients();
+      const { store: next, client } = mergeUpsert(store, payload, now);
+      await writeClients(next);
+      await mirrorClientNote(client);
+      return client;
+    },
+
+    'clients:archive': async (id) => {
+      if (typeof id !== 'string' || !id) throw new Error('archive needs a client id');
+      const store = await readClients();
+      const next = archiveClient(store, id);
+      await writeClients(next);
+      const client = next.clients.find((c) => c.id === id);
+      if (client) await mirrorClientNote(client);
+      return { ok: true };
+    },
+
+    'clients:resolve': async (name) => {
+      if (typeof name !== 'string') throw new Error('resolve needs a name string');
+      const store = await readClients();
+      return resolveClient(store.clients, name);
+    },
+
+    'clients:bootstrap': async () => {
+      const store = await readClients();
+      const names = [];
+      // from existing quotes
+      try {
+        const files = await fsp.readdir(quotesDir());
+        for (const f of files.filter((x) => x.endsWith('.md'))) {
+          const text = await fsp.readFile(path.join(quotesDir(), f), 'utf-8').catch(() => '');
+          const fm = text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
+          const client = fm.match(/^client: "?(.*?)"?$/m)?.[1];
+          if (client) names.push(client);
+        }
+      } catch {
+        /* no quotes dir yet */
+      }
+      // from open work items
+      const cache = await readCache();
+      for (const item of cache.items ?? []) {
+        if (item.client) names.push(item.client);
+      }
+      const { store: next, created } = bootstrapFromNames(store, names, now);
+      await writeClients(next);
+      for (const c of next.clients) {
+        if ((c.tags ?? []).includes('bootstrap')) await mirrorClientNote(c);
+      }
+      return { created, linked: names.length };
     },
   };
 }

@@ -130,3 +130,99 @@ test('manual rejects paths escaping the vault; generate rejects empty quotes', a
   await assert.rejects(() => w.handlers['quotes:manual']('../../etc/passwd'), /escapes/);
   await assert.rejects(() => w.handlers['quotes:generate']({ client: 'x', lineItems: [] }), /line item/);
 });
+
+test('clients upsert list resolve archive and vault mirror', async () => {
+  const w = makeWorld();
+  const client = await w.handlers['clients:upsert']({
+    name: 'ACME GmbH',
+    status: 'active',
+    contacts: [{ name: 'Petra', email: 'petra@acme.test', primary: true }],
+    billing: { taxId: 'DE123', addressLines: ['Str. 1'], city: 'Berlin', country: 'DE' },
+  });
+  assert.ok(client.id);
+  assert.equal(client.name, 'ACME GmbH');
+
+  const list = await w.handlers['clients:list']({});
+  assert.equal(list.length, 1);
+
+  const resolved = await w.handlers['clients:resolve']('acme gmbh');
+  assert.equal(resolved.client.id, client.id);
+
+  const got = await w.handlers['clients:get'](client.id);
+  assert.equal(got.billing.taxId, 'DE123');
+
+  // vault mirror
+  const mirror = join(w.vault, '30-cross-context', 'clients');
+  assert.ok(existsSync(mirror));
+  const notes = require('node:fs').readdirSync(mirror).filter((f) => f.endsWith('.md'));
+  assert.equal(notes.length, 1);
+  assert.ok(readFileSync(join(mirror, notes[0]), 'utf-8').includes('DE123'));
+
+  await w.handlers['clients:archive'](client.id);
+  const active = await w.handlers['clients:list']({});
+  assert.equal(active.length, 0);
+  const archived = await w.handlers['clients:list']({ status: 'archived' });
+  assert.equal(archived.length, 1);
+});
+
+test('generate with clientId enriches pdf and frontmatter', async () => {
+  const w = makeWorld();
+  const client = await w.handlers['clients:upsert']({
+    name: 'ACME GmbH',
+    status: 'active',
+    billing: { taxId: 'DE999', addressLines: ['Hauptstr. 1'] },
+    defaults: { paymentTerms: 'net 45' },
+  });
+  const quote = {
+    client: 'ACME GmbH',
+    clientId: client.id,
+    project: 'Portal',
+    scopeSummary: 'Build',
+    lineItems: [{ description: 'backend', hours: 10, rate: 'development' }],
+    assumptions: [],
+    sourceNote: '00-inbox/mail-acme.md',
+  };
+  const { notePath, clientId } = await w.handlers['quotes:generate'](quote);
+  assert.equal(clientId, client.id);
+  assert.ok(w.pdfCalls[0].includes('Tax ID: DE999'));
+  assert.ok(w.pdfCalls[0].includes('Hauptstr. 1'));
+  assert.ok(w.pdfCalls[0].includes('net 45'));
+  const md = readFileSync(notePath, 'utf-8');
+  assert.ok(md.includes(`clientId: "${client.id}"`));
+});
+
+test('bootstrap seeds clients from quote history and work items', async () => {
+  const w = makeWorld();
+  await w.handlers['quotes:generate']({
+    client: 'Fresh Co',
+    project: 'X',
+    scopeSummary: 'y',
+    lineItems: [{ description: 'a', hours: 1, rate: 'default' }],
+    assumptions: [],
+  });
+  w.llmResponses.push({
+    items: [{ title: 'Job', client: 'Work Item Inc', ask: 'do stuff', sourceNote: '00-inbox/mail-acme.md', confidence: 0.8 }],
+  });
+  await w.handlers['quotes:sweep']({});
+
+  const { created } = await w.handlers['clients:bootstrap']();
+  assert.ok(created >= 2);
+  const list = await w.handlers['clients:list']({});
+  const names = list.map((c) => c.name);
+  assert.ok(names.includes('Fresh Co'));
+  assert.ok(names.includes('Work Item Inc'));
+});
+
+test('draft attaches clientId when CRM has an exact match', async () => {
+  const w = makeWorld();
+  const client = await w.handlers['clients:upsert']({ name: 'ACME GmbH', status: 'active' });
+  w.llmResponses.push({
+    client: 'ACME GmbH',
+    project: 'Booking portal',
+    scopeSummary: 'Small booking portal',
+    lineItems: [{ description: 'backend', hours: 20, rate: 'development' }],
+    assumptions: [],
+  });
+  const draft = await w.handlers['quotes:draft']({ notePath: '00-inbox/mail-acme.md' });
+  assert.equal(draft.clientId, client.id);
+});

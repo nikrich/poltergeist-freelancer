@@ -46,3 +46,39 @@ test('quoteMarkdown has frontmatter and totals', () => {
   assert.ok(md.includes('950'));
   assert.ok(md.includes('00-inbox/mail.md'));
 });
+
+test('renderQuoteHtml bill-to includes tax id address and escapes client fields', () => {
+  const client = {
+    id: 'abc123',
+    name: 'ACME',
+    legalName: 'ACME <script> GmbH',
+    contacts: [{ name: 'Petra', email: 'p@acme.test', role: 'buyer', primary: true }],
+    billing: {
+      addressLines: ['Hauptstr. 1'],
+      city: 'Berlin',
+      postalCode: '10115',
+      country: 'DE',
+      taxId: 'DE999',
+    },
+    defaults: { paymentTerms: 'net 30 client override' },
+  };
+  const html = renderQuoteHtml(quote, brand, rates, client);
+  assert.ok(html.includes('Tax ID: DE999'));
+  assert.ok(html.includes('Hauptstr. 1'));
+  assert.ok(html.includes('10115 Berlin, DE') || html.includes('10115 Berlin'));
+  assert.ok(html.includes('Petra'));
+  assert.ok(!html.includes('<script>'));
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.ok(html.includes('net 30 client override'));
+});
+
+test('quoteMarkdown includes clientId when provided', () => {
+  const md = quoteMarkdown(
+    { ...quote, clientId: 'cid-1', client: 'ACME' },
+    brand,
+    rates,
+    { id: 'cid-1', name: 'ACME', legalName: 'ACME GmbH' },
+  );
+  assert.ok(md.includes('clientId: "cid-1"'));
+  assert.ok(md.includes('ACME GmbH'));
+});

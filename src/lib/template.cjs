@@ -2,6 +2,7 @@
 // Every user/LLM-supplied string goes through esc() before interpolation.
 
 const { computeTotals, formatMoney } = require('./quotes.cjs');
+const { primaryContact } = require('./clients.cjs');
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
@@ -13,13 +14,41 @@ function esc(s) {
   })[c]);
 }
 
-function renderQuoteHtml(quote, brand, rates) {
+/** Build the prepared-for block (name, contact, billing, tax) for PDF HTML. */
+function billToHtml(quote, client) {
+  const displayName = client?.legalName || client?.name || quote.client;
+  const parts = [`    <h2>${esc(displayName)}</h2>`];
+  if (client?.legalName && client.name && client.legalName !== client.name) {
+    parts.push(`    <div class="sub">${esc(client.name)}</div>`);
+  }
+  const contact = primaryContact(client);
+  if (contact) {
+    const line = [contact.name, contact.role, contact.email, contact.phone].filter(Boolean).join(' · ');
+    parts.push(`    <div class="sub">${esc(line)}</div>`);
+  }
+  const b = client?.billing ?? {};
+  for (const line of b.addressLines ?? []) {
+    parts.push(`    <div class="sub">${esc(line)}</div>`);
+  }
+  const cityLine = [b.postalCode, b.city].filter(Boolean).join(' ');
+  const regionLine = [cityLine, b.region, b.country].filter(Boolean).join(', ');
+  if (regionLine) parts.push(`    <div class="sub">${esc(regionLine)}</div>`);
+  if (b.email && (!contact || contact.email !== b.email)) {
+    parts.push(`    <div class="sub">${esc(b.email)}</div>`);
+  }
+  if (b.taxId) parts.push(`    <div class="sub">Tax ID: ${esc(b.taxId)}</div>`);
+  if (quote.project) parts.push(`    <div style="margin-top:6px">${esc(quote.project)}</div>`);
+  return parts.join('\n');
+}
+
+function renderQuoteHtml(quote, brand, rates, client) {
   const { rows, total } = computeTotals(quote.lineItems, rates);
   const accent = /^#[0-9a-fA-F]{3,8}$/.test(brand.accentColor ?? '') ? brand.accentColor : '#C5FF3D';
   const money = (n) => esc(formatMoney(n, rates.currency ?? 'EUR'));
   const today = new Date();
   const validUntil = new Date(today.getTime() + (Number(brand.validityDays) || 14) * 86400000);
   const fmtDate = (d) => d.toISOString().slice(0, 10);
+  const terms = client?.defaults?.paymentTerms || brand.paymentTerms || '';
 
   const lineRows = rows
     .map(
@@ -54,6 +83,7 @@ function renderQuoteHtml(quote, brand, rates) {
   .block { margin-bottom: 28px; }
   .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: #9a9ea8; margin-bottom: 4px; }
   h2 { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; color: #4a4e58; }
   table { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
   th { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: #9a9ea8; text-align: left; padding: 8px 10px; border-bottom: 2px solid ${accent}; }
   td { padding: 9px 10px; border-bottom: 1px solid #e7e9ee; vertical-align: top; }
@@ -83,8 +113,7 @@ function renderQuoteHtml(quote, brand, rates) {
 
   <div class="block">
     <div class="label">prepared for</div>
-    <h2>${esc(quote.client)}</h2>
-    <div>${esc(quote.project ?? '')}</div>
+${billToHtml(quote, client)}
   </div>
 
   <div class="block">
@@ -110,30 +139,34 @@ ${assumptions}
   </div>
 ` : ''}
   <footer>
-    <span>${esc(brand.paymentTerms ?? '')}</span>
+    <span>${esc(terms)}</span>
     <span>${esc(brand.businessName ?? '')}</span>
   </footer>
 </body>
 </html>`;
 }
 
-function quoteMarkdown(quote, brand, rates) {
+function quoteMarkdown(quote, brand, rates, client) {
   const { rows, total } = computeTotals(quote.lineItems, rates);
   const currency = rates.currency ?? 'EUR';
+  const terms = client?.defaults?.paymentTerms || brand.paymentTerms || '';
+  const displayName = client?.legalName || client?.name || quote.client;
   const lines = rows
     .map((r) => `| ${r.description.replace(/\|/g, '\\|')} | ${r.hours} | ${formatMoney(r.hourly, currency)} | ${formatMoney(r.amount, currency)} |`)
     .join('\n');
+  const escFm = (s) => String(s ?? '').replace(/"/g, '\\"');
+  const clientIdLine = quote.clientId || client?.id ? `clientId: "${escFm(quote.clientId || client?.id)}"\n` : '';
   return `---
-client: "${String(quote.client ?? '').replace(/"/g, '\\"')}"
-project: "${String(quote.project ?? '').replace(/"/g, '\\"')}"
+client: "${escFm(displayName)}"
+${clientIdLine}project: "${escFm(quote.project)}"
 total: ${total}
 currency: ${currency}
 status: draft
-source: "${String(quote.sourceNote ?? '').replace(/"/g, '\\"')}"
+source: "${escFm(quote.sourceNote)}"
 generated: ${new Date().toISOString()}
 ---
 
-# Quote — ${quote.client}
+# Quote — ${displayName}
 
 **Project:** ${quote.project ?? ''}
 
@@ -155,8 +188,8 @@ ${(quote.assumptions ?? []).map((a) => `- ${a}`).join('\n')}
 
 ## Terms
 
-${brand.paymentTerms ?? ''} — valid ${Number(brand.validityDays) || 14} days.
+${terms} — valid ${Number(brand.validityDays) || 14} days.
 `;
 }
 
-module.exports = { esc, renderQuoteHtml, quoteMarkdown };
+module.exports = { esc, billToHtml, renderQuoteHtml, quoteMarkdown };
