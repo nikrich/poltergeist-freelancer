@@ -6,7 +6,8 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { mergeSweep, itemId, parseStrictJson, quoteBasename } = require('./lib/quotes.cjs');
-const { renderQuoteHtml, quoteMarkdown } = require('./lib/template.cjs');
+const { renderQuoteHtml, quoteMarkdown, renderInvoiceHtml, invoiceMarkdown } = require('./lib/template.cjs');
+const { currentNumber, advanceCounter, invoiceBasename, parseDataComment, resolveVatRate } = require('./lib/invoices.cjs');
 const { parseFrontmatter, setFrontmatterField, QUOTE_TRANSITIONS, INVOICE_TRANSITIONS, assertTransition, isOverdue } = require('./lib/lifecycle.cjs');
 const {
   emptyStore,
@@ -34,6 +35,7 @@ const DEFAULT_CONFIG = {
     validityDays: 14,
   },
   rates: { currency: 'EUR', default: 0, named: [] },
+  invoicing: { prefix: 'INV', vatRate: 0, netDays: 14, yearReset: true },
 };
 
 const WORK_ITEMS_SCHEMA = {
@@ -117,6 +119,24 @@ function createHandlers(ctx, deps = {}) {
   const vaultDir = () => expandHome(config().vaultPath);
   const quotesDir = () => path.join(vaultDir(), '30-cross-context', 'quotes');
   const clientsVaultDir = () => path.join(vaultDir(), '30-cross-context', 'clients');
+  const counterPath = path.join(ctx.dataDir, 'counter.json');
+  const invoicesDir = () => path.join(vaultDir(), '30-cross-context', 'invoices');
+
+  async function readCounter() {
+    const { invoicing } = config();
+    try {
+      return JSON.parse(await fsp.readFile(counterPath, 'utf-8'));
+    } catch {
+      return { prefix: invoicing.prefix, year: now().getFullYear(), next: 1, yearReset: invoicing.yearReset };
+    }
+  }
+  async function writeCounter(c) {
+    await fsp.mkdir(ctx.dataDir, { recursive: true });
+    const tmp = `${counterPath}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(c, null, 2));
+    await fsp.rename(tmp, counterPath);
+  }
+  function fmtDate(d) { return d.toISOString().slice(0, 10); }
 
   async function readCache() {
     try {
@@ -421,6 +441,153 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
         });
       }
       return out;
+    },
+
+    /* ---------- invoices ---------- */
+
+    'invoices:counter': async () => readCounter(),
+
+    'invoices:set-counter': async ({ next } = {}) => {
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1) throw new Error('next must be a positive integer');
+      const c = await readCounter();
+      await writeCounter({ ...c, next: n });
+      return { ok: true };
+    },
+
+    'invoices:draft': async (from = {}) => {
+      const { invoicing, rates } = config();
+      const counter = await readCounter();
+      const number = currentNumber(counter, now().getFullYear());
+      const issued = fmtDate(now());
+      const due = fmtDate(new Date(now().getTime() + (Number(invoicing.netDays) || 14) * 86400000));
+      let base = { number, issued, due, client: '', lineItems: [], vatRate: invoicing.vatRate ?? 0, currency: rates.currency };
+
+      if (from.quoteFile) {
+        if (from.quoteFile !== path.basename(from.quoteFile)) throw new Error('quoteFile must be a basename');
+        const text = await fsp.readFile(path.join(quotesDir(), from.quoteFile), 'utf-8');
+        const { fields } = parseFrontmatter(text);
+        const data = parseDataComment(text);
+        const store = await readClients();
+        const client = fields.clientId ? store.clients.find((c) => c.id === fields.clientId) : resolveClient(store.clients, fields.client).client;
+        base = {
+          ...base,
+          client: fields.client, clientId: client?.id, project: fields.project, quoteRef: from.quoteFile,
+          lineItems: data?.lineItems ?? [],
+          vatRate: resolveVatRate({ clientVat: client?.defaults?.vatRate, settingsVat: invoicing.vatRate }),
+          currency: client?.defaults?.currency || rates.currency,
+        };
+      } else if (from.clientId) {
+        const client = await findClient(from.clientId);
+        if (!client) throw new Error(`unknown client: ${from.clientId}`);
+        base = {
+          ...base, client: client.name, clientId: client.id,
+          vatRate: resolveVatRate({ clientVat: client.defaults?.vatRate, settingsVat: invoicing.vatRate }),
+          currency: client.defaults?.currency || rates.currency,
+        };
+      }
+      return base;
+    },
+
+    'invoices:generate': async (invoice) => {
+      if (!invoice || typeof invoice !== 'object') throw new Error('generate needs an invoice');
+      if (!invoice.client || !Array.isArray(invoice.lineItems) || invoice.lineItems.length === 0) {
+        throw new Error('invoice needs a client and at least one line item');
+      }
+      const { brand, rates: baseRates, invoicing } = config();
+      let client = null;
+      if (invoice.clientId) {
+        client = await findClient(invoice.clientId);
+      } else {
+        const store = await readClients();
+        client = resolveClient(store.clients, invoice.client).client;
+      }
+      const rates = { ...baseRates, currency: invoice.currency || client?.defaults?.currency || baseRates.currency };
+      const counter = await readCounter();
+      const year = now().getFullYear();
+      const inv = {
+        ...invoice,
+        number: currentNumber(counter, year),
+        issued: invoice.issued || fmtDate(now()),
+        due: invoice.due || fmtDate(new Date(now().getTime() + (Number(invoicing.netDays) || 14) * 86400000)),
+        vatRate: resolveVatRate({ invoiceVat: invoice.vatRate, clientVat: client?.defaults?.vatRate, settingsVat: invoicing.vatRate }),
+      };
+      const html = renderInvoiceHtml(inv, brand, rates, client || undefined);
+      const pdf = await renderPdf(html);
+
+      const dir = invoicesDir();
+      await fsp.mkdir(dir, { recursive: true });
+      let c = counter;
+      let base = invoiceBasename(client?.name || inv.client, inv.number);
+      for (;;) {
+        try {
+          await fsp.access(path.join(dir, `${base}.md`));
+          c = advanceCounter(c, year);
+          inv.number = currentNumber(c, year);
+          base = invoiceBasename(client?.name || inv.client, inv.number);
+        } catch {
+          break;
+        }
+      }
+      await fsp.writeFile(path.join(dir, `${base}.pdf`), pdf);
+      await fsp.writeFile(path.join(dir, `${base}.md`), invoiceMarkdown(inv, brand, rates, client || undefined));
+      await writeCounter(advanceCounter(c, year));
+
+      if (inv.quoteRef) {
+        try {
+          const qFull = path.join(quotesDir(), inv.quoteRef);
+          const qText = await fsp.readFile(qFull, 'utf-8');
+          const next = setFrontmatterField(qText, 'invoiced', 'true');
+          const tmp = `${qFull}.tmp`;
+          await fsp.writeFile(tmp, next);
+          await fsp.rename(tmp, qFull);
+        } catch (err) {
+          ctx.log('quote invoiced-stamp failed:', err.message);
+        }
+      }
+      ctx.log('invoice generated:', path.join(dir, `${base}.pdf`));
+      return { pdfPath: path.join(dir, `${base}.pdf`), notePath: path.join(dir, `${base}.md`), number: inv.number };
+    },
+
+    'invoices:list': async () => {
+      let files;
+      try {
+        files = await fsp.readdir(invoicesDir());
+      } catch {
+        return [];
+      }
+      const out = [];
+      const today = now();
+      for (const f of files.filter((x) => x.endsWith('.md')).sort().reverse()) {
+        const text = await fsp.readFile(path.join(invoicesDir(), f), 'utf-8').catch(() => '');
+        const { fields } = parseFrontmatter(text);
+        const status = fields.status || 'draft';
+        const doc = { status, due: fields.due };
+        const overdue = isOverdue(doc, today);
+        out.push({
+          file: f,
+          number: fields.number ?? '',
+          client: fields.client ?? '',
+          clientId: fields.clientId || null,
+          project: fields.project ?? '',
+          quoteRef: fields.quoteRef || null,
+          total: Number(fields.total) || 0,
+          currency: fields.currency ?? '',
+          issued: fields.issued ?? '',
+          due: fields.due ?? '',
+          status,
+          paidAt: fields.paidAt || null,
+          overdue,
+          daysOverdue: overdue ? Math.floor((today.getTime() - new Date(fields.due).getTime()) / 86400000) : 0,
+          pdf: files.includes(f.replace(/\.md$/, '.pdf')),
+        });
+      }
+      return out;
+    },
+
+    'invoices:set-status': async ({ file, status } = {}) => {
+      const extra = status === 'paid' ? { paidAt: now().toISOString() } : {};
+      return rewriteStatus(invoicesDir(), file, status, INVOICE_TRANSITIONS, extra);
     },
 
     /* ---------- clients CRM ---------- */

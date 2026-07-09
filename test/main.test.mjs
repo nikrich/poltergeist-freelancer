@@ -52,6 +52,7 @@ function makeWorld() {
       pdfCalls.push(html);
       return Buffer.from('%PDF-fake');
     },
+    now: () => new Date('2026-07-09T12:00:00Z'),
   });
   return { handlers, llmResponses, sent, pdfCalls, vault };
 }
@@ -249,4 +250,54 @@ test('quote status walks draft -> sent -> accepted and rejects bad moves', async
   assert.equal(after.status, 'accepted');
   await assert.rejects(w.handlers['quotes:set-status']({ file: row.file, status: 'sent' }), /invalid transition/);
   await assert.rejects(w.handlers['quotes:set-status']({ file: '../evil.md', status: 'sent' }), /basename|invalid/i);
+});
+
+test('invoice lifecycle: draft from accepted quote, generate, mark paid', async () => {
+  const w = makeWorld();
+  const q = await generateQuote(w);
+  await w.handlers['quotes:set-status']({ file: q.file, status: 'sent' });
+  await w.handlers['quotes:set-status']({ file: q.file, status: 'accepted' });
+
+  const draft = await w.handlers['invoices:draft']({ quoteFile: q.file });
+  assert.equal(draft.number, 'INV-2026-001');
+  assert.equal(draft.quoteRef, q.file);
+  assert.deepEqual(draft.lineItems, [{ description: 'dev', hours: 2, rate: 'default' }]);
+  assert.equal(draft.due > draft.issued, true);
+
+  const gen = await w.handlers['invoices:generate'](draft);
+  assert.match(gen.notePath, /invoice-acme-INV-2026-001\.md$/);
+  assert.ok(existsSync(gen.pdfPath));
+
+  const [row] = await w.handlers['invoices:list']();
+  assert.equal(row.number, 'INV-2026-001');
+  assert.equal(row.status, 'draft');
+  assert.equal(row.overdue, false);
+
+  // counter advanced
+  const draft2 = await w.handlers['invoices:draft']({});
+  assert.equal(draft2.number, 'INV-2026-002');
+
+  // quote stamped
+  const [qAfter] = await w.handlers['quotes:list']();
+  assert.equal(qAfter.invoiced, true);
+
+  await w.handlers['invoices:set-status']({ file: row.file, status: 'sent' });
+  await w.handlers['invoices:set-status']({ file: row.file, status: 'paid' });
+  const [paid] = await w.handlers['invoices:list']();
+  assert.equal(paid.status, 'paid');
+  assert.ok(paid.paidAt);
+  await assert.rejects(w.handlers['invoices:set-status']({ file: row.file, status: 'sent' }), /invalid transition/);
+});
+
+test('overdue is computed, never stored', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  const gen = await w.handlers['invoices:generate']({ ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }], due: '2020-01-01' });
+  const file = gen.notePath.split('/').pop();
+  await w.handlers['invoices:set-status']({ file, status: 'sent' });
+  const [row] = await w.handlers['invoices:list']();
+  assert.equal(row.overdue, true);
+  assert.ok(row.daysOverdue > 1000);
+  const text = readFileSync(gen.notePath, 'utf-8');
+  assert.ok(!text.includes('overdue'));
 });
