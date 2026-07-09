@@ -320,3 +320,35 @@ test('generate rejects an unknown clientId', async () => {
     /unknown client/,
   );
 });
+
+test('dashboard aggregates statuses, revenue, attention and activity', async () => {
+  const w = makeWorld();
+  const q = await generateQuote(w);
+  await w.handlers['quotes:set-status']({ file: q.file, status: 'sent' });
+  await w.handlers['quotes:set-status']({ file: q.file, status: 'accepted' });
+  const draft = await w.handlers['invoices:draft']({ quoteFile: q.file });
+  const gen = await w.handlers['invoices:generate'](draft);
+  const file = gen.notePath.split('/').pop();
+  await w.handlers['invoices:set-status']({ file, status: 'sent' });
+  await w.handlers['invoices:set-status']({ file, status: 'paid' });
+
+  // `q` is now accepted + invoiced, so it no longer counts as "needs attention".
+  // Generate a second quote that stays accepted but is never turned into an
+  // invoice, so the acceptedQuote attention bucket still has an entry at
+  // assert time (per the brief's note: acceptedQuote = accepted AND !invoiced).
+  const q2gen = await w.handlers['quotes:generate']({
+    client: 'ACME', project: 'Portal 2', scopeSummary: 's',
+    lineItems: [{ description: 'dev', hours: 1, rate: 'default' }], assumptions: [], sourceNote: '00-inbox/mail-acme.md',
+  });
+  const q2File = q2gen.notePath.split('/').pop();
+  await w.handlers['quotes:set-status']({ file: q2File, status: 'sent' });
+  await w.handlers['quotes:set-status']({ file: q2File, status: 'accepted' });
+
+  const s = await w.handlers['dashboard:summary']();
+  assert.equal(s.quotes.accepted, 2 /* q (invoiced) + q2 (not invoiced) */);
+  assert.equal(s.invoices.paid, 1);
+  assert.equal(s.revenue.thisMonth, 160 /* 2h x 80, vat 0 */);
+  assert.ok(s.attention.some((a) => a.kind === 'acceptedQuote'));
+  assert.ok(s.activity.length >= 2);
+  assert.ok(s.activity[0].when >= s.activity[s.activity.length - 1].when);
+});

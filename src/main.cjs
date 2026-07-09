@@ -5,7 +5,7 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { mergeSweep, itemId, parseStrictJson, quoteBasename } = require('./lib/quotes.cjs');
+const { mergeSweep, itemId, parseStrictJson, quoteBasename, formatMoney } = require('./lib/quotes.cjs');
 const { renderQuoteHtml, quoteMarkdown, renderInvoiceHtml, invoiceMarkdown } = require('./lib/template.cjs');
 const { currentNumber, advanceCounter, invoiceBasename, parseDataComment, resolveVatRate } = require('./lib/invoices.cjs');
 const { parseFrontmatter, setFrontmatterField, QUOTE_TRANSITIONS, INVOICE_TRANSITIONS, assertTransition, isOverdue } = require('./lib/lifecycle.cjs');
@@ -285,7 +285,7 @@ ${blocks}`,
     return { ok: true, status };
   }
 
-  return {
+  const handlers = {
     'quotes:set-status': async ({ file, status } = {}) => rewriteStatus(quotesDir(), file, status, QUOTE_TRANSITIONS),
 
     'quotes:sweep': async (opts = {}) => {
@@ -666,7 +666,52 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       }
       return { created, linked: names.length };
     },
+
+    /* ---------- dashboard ---------- */
+
+    'dashboard:summary': async () => {
+      const cache = await readCache();
+      const quotes = await handlers['quotes:list']();
+      const invoices = await handlers['invoices:list']();
+      const { rates } = config();
+      const count = (xs, k) => xs.filter((x) => x.status === k).length;
+      const monthKey = (iso) => String(iso ?? '').slice(0, 7);
+      const thisM = monthKey(now().toISOString());
+      const lastM = monthKey(new Date(now().getFullYear(), now().getMonth() - 1, 15).toISOString());
+      const paid = invoices.filter((i) => i.status === 'paid');
+      const sum = (xs) => Math.round(xs.reduce((s, i) => s + i.total, 0) * 100) / 100;
+
+      const attention = [
+        ...cache.items.map((i) => ({ kind: 'workItem', label: `${i.client} — ${i.title}`, ref: i.id })),
+        ...quotes.filter((q) => q.status === 'accepted' && !q.invoiced).map((q) => ({ kind: 'acceptedQuote', label: `${q.client} — ${q.project}`, ref: q.file })),
+        ...invoices.filter((i) => i.overdue).map((i) => ({ kind: 'overdueInvoice', label: `${i.number} — ${i.client} — ${i.daysOverdue}d overdue`, ref: i.file })),
+      ];
+      const activity = [
+        ...quotes.map((q) => ({ kind: 'quote', label: `quote ${q.status} — ${q.client}`, when: q.generated })),
+        ...invoices.map((i) => ({ kind: 'invoice', label: `invoice ${i.status} — ${i.number}`, when: i.issued })),
+        ...paid.map((i) => ({ kind: 'paid', label: `paid — ${i.number} — ${formatMoney(i.total, i.currency || rates.currency)}`, when: i.paidAt })),
+      ].filter((a) => a.when).sort((a, b) => (a.when < b.when ? 1 : -1)).slice(0, 10);
+
+      return {
+        workItems: cache.items.length,
+        quotes: { draft: count(quotes, 'draft'), sent: count(quotes, 'sent'), accepted: count(quotes, 'accepted'), declined: count(quotes, 'declined') },
+        invoices: {
+          draft: count(invoices, 'draft'), sent: count(invoices, 'sent'), paid: paid.length,
+          overdue: invoices.filter((i) => i.overdue).length,
+          unpaidTotal: sum(invoices.filter((i) => i.status === 'sent')),
+          currency: rates.currency,
+        },
+        revenue: {
+          thisMonth: sum(paid.filter((i) => monthKey(i.paidAt) === thisM)),
+          lastMonth: sum(paid.filter((i) => monthKey(i.paidAt) === lastM)),
+          currency: rates.currency,
+        },
+        attention,
+        activity,
+      };
+    },
   };
+  return handlers;
 }
 
 let active = null;
