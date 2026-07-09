@@ -3,7 +3,7 @@
 // docs/design/fk-clients.jsx (layout reference only — no Lucide icons here,
 // unicode/text affordances instead) and the kit primitives used elsewhere.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatMoney } from '../../lib/money.cjs';
 import { Panel, Btn, Pill, StatusPill, ErrorBanner, inputStyle } from '../kit.jsx';
 
@@ -49,11 +49,28 @@ export function ClientsTab({ api, s }) {
   const [error, setError] = useState('');
   const [bootstrapMsg, setBootstrapMsg] = useState('');
 
+  // Tracks the "live" selection outside of React's render cycle so in-flight
+  // save()/archive() calls can tell, once their IPC round-trip resolves,
+  // whether the user has since selected a different client and bail instead
+  // of clobbering the newer UI state.
+  const selectedIdRef = useRef(null);
+  const setSelection = (id) => {
+    selectedIdRef.current = id;
+    setSelectedId(id);
+  };
+
+  // Sequence guard: search keystrokes and other refreshList() callers can race
+  // and resolve out of order. Only the result of the most recently *started*
+  // call is allowed to land.
+  const listSeqRef = useRef(0);
   const refreshList = useCallback(async () => {
+    const seq = ++listSeqRef.current;
     try {
       const list = await api.ipc.invoke('clients:list', { q: q || undefined, status: showArchived ? 'archived' : 'all' });
+      if (seq !== listSeqRef.current) return; // a newer refresh has since started; drop this stale result
       setClients(list);
     } catch (e) {
+      if (seq !== listSeqRef.current) return;
       setError(e.message);
     }
   }, [api, q, showArchived]);
@@ -78,7 +95,7 @@ export function ClientsTab({ api, s }) {
 
   const selectClient = async (id) => {
     setError('');
-    setSelectedId(id);
+    setSelection(id);
     try {
       const c = await api.ipc.invoke('clients:get', id);
       setDetail(c);
@@ -90,19 +107,25 @@ export function ClientsTab({ api, s }) {
 
   const newClient = () => {
     setError('');
-    setSelectedId(null);
+    setSelection(null);
     setDetail(emptyClient());
     setTagsText('');
   };
 
   const save = async () => {
     setError('');
+    // Capture the client this save is for; if the user selects someone else
+    // before the round-trip resolves, we still refresh the list but skip the
+    // selection/detail writeback below.
+    const targetId = selectedIdRef.current;
     try {
       const payload = { ...detail, tags: tagsText.split(',').map((t) => t.trim()).filter(Boolean) };
       const saved = await api.ipc.invoke('clients:upsert', payload);
-      setDetail(saved);
-      setTagsText((saved.tags ?? []).join(', '));
-      setSelectedId(saved.id);
+      if (selectedIdRef.current === targetId) {
+        setDetail(saved);
+        setTagsText((saved.tags ?? []).join(', '));
+        setSelection(saved.id);
+      }
       await refreshList();
     } catch (e) {
       setError(e.message);
@@ -112,10 +135,13 @@ export function ClientsTab({ api, s }) {
   const archive = async () => {
     if (!detail?.id) return;
     setError('');
+    const targetId = detail.id;
     try {
       await api.ipc.invoke('clients:archive', detail.id);
-      setSelectedId(null);
-      setDetail(null);
+      if (selectedIdRef.current === targetId) {
+        setSelection(null);
+        setDetail(null);
+      }
       await refreshList();
     } catch (e) {
       setError(e.message);
