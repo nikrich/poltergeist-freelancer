@@ -106,12 +106,12 @@ export function StatusPill({ s, status }) {
   return <Pill s={s} tone={STATUS_TONE[status] ?? 'fog'}>{status}</Pill>;
 }
 
-export function StatTile({ s, label, value, sub, accent }) {
+export function StatTile({ s, label, value, sub, accent, subTone }) {
   return (
     <div style={{ background: s.vellum, border: `1px solid ${s.hairline}`, borderRadius: 10, padding: '12px 14px', flex: 1, minWidth: 0 }}>
       <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 10, textTransform: 'lowercase', letterSpacing: '0.1em', color: s.ink2 }}>{label}</div>
       <div style={{ fontSize: 22, fontWeight: 700, color: accent ? s.neon : s.ink0, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{value}</div>
-      {sub && <div style={{ fontSize: 11, color: s.ink2, marginTop: 2 }}>{sub}</div>}
+      {sub && <div style={{ fontSize: 11, color: subTone ?? s.ink2, marginTop: 2 }}>{sub}</div>}
     </div>
   );
 }
