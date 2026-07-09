@@ -49,13 +49,17 @@ export function ClientsTab({ api, s }) {
   const [error, setError] = useState('');
   const [bootstrapMsg, setBootstrapMsg] = useState('');
 
-  // Tracks the "live" selection outside of React's render cycle so in-flight
-  // save()/archive() calls can tell, once their IPC round-trip resolves,
-  // whether the user has since selected a different client and bail instead
-  // of clobbering the newer UI state.
-  const selectedIdRef = useRef(null);
+  // Monotonic selection token: bumped on every selection-identity change
+  // (selectClient, newClient, and the post-save re-select). In-flight async
+  // writebacks (selectClient's fetch, save(), archive()) capture the token
+  // before their IPC round-trip and only apply their result if the token is
+  // unchanged on completion — otherwise the user has since moved on (picked
+  // another client, started another draft, etc.) and the result is stale.
+  // This also distinguishes two unsaved drafts from one another even though
+  // both have selectedId === null.
+  const selectionSeqRef = useRef(0);
   const setSelection = (id) => {
-    selectedIdRef.current = id;
+    selectionSeqRef.current += 1;
     setSelectedId(id);
   };
 
@@ -96,11 +100,17 @@ export function ClientsTab({ api, s }) {
   const selectClient = async (id) => {
     setError('');
     setSelection(id);
+    // Capture the token after setSelection bumps it, so a rapid second
+    // selectClient/newClient call (e.g. fast A→B row clicks) invalidates
+    // this fetch's writeback below.
+    const token = selectionSeqRef.current;
     try {
       const c = await api.ipc.invoke('clients:get', id);
+      if (selectionSeqRef.current !== token) return; // selection moved on; drop this stale fetch
       setDetail(c);
       setTagsText((c.tags ?? []).join(', '));
     } catch (e) {
+      if (selectionSeqRef.current !== token) return;
       setError(e.message);
     }
   };
@@ -114,14 +124,16 @@ export function ClientsTab({ api, s }) {
 
   const save = async () => {
     setError('');
-    // Capture the client this save is for; if the user selects someone else
-    // before the round-trip resolves, we still refresh the list but skip the
-    // selection/detail writeback below.
-    const targetId = selectedIdRef.current;
+    // Capture the selection token this save is for; if the user selects
+    // someone else, or starts another draft, before the round-trip resolves,
+    // we still refresh the list but skip the selection/detail writeback
+    // below. Unlike an id comparison, the token also distinguishes two
+    // unsaved drafts from one another (both have selectedId === null).
+    const token = selectionSeqRef.current;
     try {
       const payload = { ...detail, tags: tagsText.split(',').map((t) => t.trim()).filter(Boolean) };
       const saved = await api.ipc.invoke('clients:upsert', payload);
-      if (selectedIdRef.current === targetId) {
+      if (selectionSeqRef.current === token) {
         setDetail(saved);
         setTagsText((saved.tags ?? []).join(', '));
         setSelection(saved.id);
@@ -135,10 +147,10 @@ export function ClientsTab({ api, s }) {
   const archive = async () => {
     if (!detail?.id) return;
     setError('');
-    const targetId = detail.id;
+    const token = selectionSeqRef.current;
     try {
       await api.ipc.invoke('clients:archive', detail.id);
-      if (selectedIdRef.current === targetId) {
+      if (selectionSeqRef.current === token) {
         setSelection(null);
         setDetail(null);
       }
