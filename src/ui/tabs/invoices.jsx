@@ -255,13 +255,19 @@ export function InvoicesTab({ api, s, config, pendingInvoiceDraft, setPendingInv
     void loadList();
   }, [loadList]);
 
+  const loadAcceptedQuotes = useCallback(async () => {
+    try {
+      const qs = await api.ipc.invoke('quotes:list');
+      setAcceptedQuotes(qs.filter((q) => q.status === 'accepted' && !q.invoiced));
+    } catch (e) {
+      setError(e.message);
+    }
+  }, [api]);
+
   useEffect(() => {
     api.ipc.invoke('clients:list', {}).then(setClients).catch((e) => setError(e.message));
-    api.ipc
-      .invoke('quotes:list')
-      .then((qs) => setAcceptedQuotes(qs.filter((q) => q.status === 'accepted' && !q.invoiced)))
-      .catch((e) => setError(e.message));
-  }, [api]);
+    void loadAcceptedQuotes();
+  }, [api, loadAcceptedQuotes]);
 
   // Consume a draft handed off from the quotes tab's "convert to invoice" flow.
   useEffect(() => {
@@ -305,6 +311,8 @@ export function InvoicesTab({ api, s, config, pendingInvoiceDraft, setPendingInv
         onDone={() => {
           setDraft(null);
           void loadList();
+          // A just-invoiced quote must drop out of the "from accepted quote" menu.
+          void loadAcceptedQuotes();
         }}
       />
     );

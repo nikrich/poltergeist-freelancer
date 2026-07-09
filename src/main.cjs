@@ -125,8 +125,12 @@ function createHandlers(ctx, deps = {}) {
   async function readCounter() {
     const { invoicing } = config();
     try {
-      return JSON.parse(await fsp.readFile(counterPath, 'utf-8'));
-    } catch {
+      const stored = JSON.parse(await fsp.readFile(counterPath, 'utf-8'));
+      // Live settings (prefix/yearReset) always win over what's on disk; year/next
+      // are the file's own bookkeeping and must not be clobbered by settings reads.
+      return { ...stored, prefix: invoicing.prefix, yearReset: invoicing.yearReset };
+    } catch (err) {
+      ctx.log('counter.json unreadable, reseeding:', err.message);
       return { prefix: invoicing.prefix, year: now().getFullYear(), next: 1, yearReset: invoicing.yearReset };
     }
   }
@@ -455,13 +459,13 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
 
     'invoices:counter': async () => readCounter(),
 
-    'invoices:set-counter': async ({ next } = {}) => {
+    'invoices:set-counter': serialized(async ({ next } = {}) => {
       const n = Number(next);
       if (!Number.isInteger(n) || n < 1) throw new Error('next must be a positive integer');
       const c = await readCounter();
       await writeCounter({ ...c, next: n });
       return { ok: true };
-    },
+    }),
 
     'invoices:draft': async (from = {}) => {
       const { invoicing, rates } = config();
@@ -521,11 +525,11 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
         due: invoice.due || fmtDate(new Date(now().getTime() + (Number(invoicing.netDays) || 14) * 86400000)),
         vatRate: resolveVatRate({ invoiceVat: invoice.vatRate, clientVat: client?.defaults?.vatRate, settingsVat: invoicing.vatRate }),
       };
-      const html = renderInvoiceHtml(inv, brand, rates, client || undefined);
-      const pdf = await renderPdf(html);
-
       const dir = invoicesDir();
       await fsp.mkdir(dir, { recursive: true });
+      // Settle the final invoice number (and basename) via the collision loop
+      // BEFORE rendering — the PDF/HTML must carry the number that actually
+      // ends up on disk, never the pre-collision guess.
       let c = counter;
       let base = invoiceBasename(client?.name || inv.client, inv.number);
       for (;;) {
@@ -538,20 +542,26 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
           break;
         }
       }
+      const html = renderInvoiceHtml(inv, brand, rates, client || undefined);
+      const pdf = await renderPdf(html);
       await fsp.writeFile(path.join(dir, `${base}.pdf`), pdf);
       await fsp.writeFile(path.join(dir, `${base}.md`), invoiceMarkdown(inv, brand, rates, client || undefined));
       await writeCounter(advanceCounter(c, year));
 
       if (inv.quoteRef) {
-        try {
-          const qFull = path.join(quotesDir(), inv.quoteRef);
-          const qText = await fsp.readFile(qFull, 'utf-8');
-          const next = setFrontmatterField(qText, 'invoiced', 'true');
-          const tmp = `${qFull}.tmp`;
-          await fsp.writeFile(tmp, next);
-          await fsp.rename(tmp, qFull);
-        } catch (err) {
-          ctx.log('quote invoiced-stamp failed:', err.message);
+        if (inv.quoteRef !== path.basename(inv.quoteRef) || !inv.quoteRef.endsWith('.md')) {
+          ctx.log('quote invoiced-stamp skipped: quoteRef is not a safe basename:', inv.quoteRef);
+        } else {
+          try {
+            const qFull = path.join(quotesDir(), inv.quoteRef);
+            const qText = await fsp.readFile(qFull, 'utf-8');
+            const next = setFrontmatterField(qText, 'invoiced', 'true');
+            const tmp = `${qFull}.tmp`;
+            await fsp.writeFile(tmp, next);
+            await fsp.rename(tmp, qFull);
+          } catch (err) {
+            ctx.log('quote invoiced-stamp failed:', err.message);
+          }
         }
       }
       ctx.log('invoice generated:', path.join(dir, `${base}.pdf`));

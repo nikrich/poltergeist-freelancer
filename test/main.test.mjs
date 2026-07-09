@@ -54,7 +54,7 @@ function makeWorld() {
     },
     now: () => new Date('2026-07-09T12:00:00Z'),
   });
-  return { handlers, llmResponses, sent, pdfCalls, vault };
+  return { handlers, llmResponses, sent, pdfCalls, vault, settings };
 }
 
 test('sweep finds the seeded work request and caches it', async () => {
@@ -351,4 +351,52 @@ test('dashboard aggregates statuses, revenue, attention and activity', async () 
   assert.ok(s.attention.some((a) => a.kind === 'acceptedQuote'));
   assert.ok(s.activity.length >= 2);
   assert.ok(s.activity[0].when >= s.activity[s.activity.length - 1].when);
+});
+
+test('finding 1: once counter.json exists, live prefix/yearReset settings still apply (year/next stay file-truth)', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+  });
+  // counter.json now persists with prefix "INV". Change the live settings.
+  const cfg = w.settings.get('config');
+  w.settings.set('config', { ...cfg, invoicing: { ...(cfg.invoicing ?? {}), prefix: 'RD' } });
+
+  const draft2 = await w.handlers['invoices:draft']({});
+  assert.ok(draft2.number.startsWith('RD-'), `expected number to start with RD-, got ${draft2.number}`);
+  // next/year are still file-truth: second invoice continues the sequence, doesn't reset.
+  assert.equal(draft2.number, 'RD-2026-002');
+});
+
+test('finding 2: quoteRef path traversal is rejected in the generate stamp step', async () => {
+  const w = makeWorld();
+  const evilPath = join(w.vault, 'evil.md');
+  const evilOriginal = '---\nstatus: draft\ninvoiced: false\n---\n\n# Evil\n';
+  writeFileSync(evilPath, evilOriginal);
+
+  const draft = await w.handlers['invoices:draft']({});
+  const gen = await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+    quoteRef: '../../evil.md',
+  });
+  assert.ok(existsSync(gen.notePath));
+  assert.equal(readFileSync(evilPath, 'utf-8'), evilOriginal, 'evil.md outside quotesDir must be untouched');
+});
+
+test('finding 3: pdf carries the collision-resolved invoice number, not the pre-collision one', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  const first = await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+  });
+  // roll the counter back so the next generate collides with the first invoice's filename
+  await w.handlers['invoices:set-counter']({ next: 1 });
+  const second = await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+  });
+  assert.notEqual(second.number, first.number);
+  const html = w.pdfCalls[w.pdfCalls.length - 1];
+  assert.ok(html.includes(second.number), `pdf html should contain final number ${second.number}`);
+  assert.ok(!html.includes(first.number), `pdf html should not contain pre-collision number ${first.number}`);
 });

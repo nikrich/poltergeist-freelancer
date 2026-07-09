@@ -1,4 +1,4 @@
-// Quote rendering: branded A4 HTML for printToPDF, and the vault markdown note.
+// Quote and invoice rendering: branded A4 HTML for printToPDF, and the vault markdown notes.
 // Every user/LLM-supplied string goes through esc() before interpolation.
 
 const { computeTotals, formatMoney } = require('./quotes.cjs');
