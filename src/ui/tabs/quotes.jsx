@@ -1,9 +1,9 @@
 // Quotes tab: work items → composer → generated quote. Moved from renderer.jsx
 // verbatim (pre-redesign); imports now come from the shared kit.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { computeTotals, formatMoney } from '../../lib/money.cjs';
-import { Panel, ErrorBanner, btnStyle, inputStyle } from '../kit.jsx';
+import { Panel, Btn, Pill, StatusPill, ErrorBanner, btnStyle, inputStyle } from '../kit.jsx';
 
 function WorkItems({ api, s, onQuote }) {
   const [items, setItems] = useState([]);
@@ -236,14 +236,110 @@ function Composer({ api, s, draftRef, config, onDone, onBack }) {
   );
 }
 
-export function QuotesTab({ api, s, config }) {
+function HistoryRow({ s, row, busy, onSetStatus, onConvert }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: `1px solid ${s.hairline}` }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13 }}>
+          <span style={{ fontWeight: 600, color: s.ink0 }}>{row.client}</span>
+          {row.project && <span style={{ color: s.ink2 }}> · {row.project}</span>}
+        </div>
+        <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, color: s.ink2, marginTop: 2 }}>
+          {formatMoney(row.total, row.currency || 'EUR')} · {(row.generated || '').slice(0, 10)}
+        </div>
+      </div>
+      <StatusPill s={s} status={row.status} />
+      {row.status === 'draft' && (
+        <Btn s={s} disabled={busy} onClick={() => onSetStatus('sent')}>mark sent</Btn>
+      )}
+      {row.status === 'sent' && (
+        <>
+          <Btn s={s} danger disabled={busy} onClick={() => onSetStatus('declined')}>declined</Btn>
+          <Btn s={s} disabled={busy} onClick={() => onSetStatus('accepted')}>accepted</Btn>
+        </>
+      )}
+      {row.status === 'declined' && (
+        <Btn s={s} disabled={busy} onClick={() => onSetStatus('sent')}>mark sent</Btn>
+      )}
+      {row.status === 'accepted' && !row.invoiced && (
+        <Btn s={s} primary disabled={busy} onClick={onConvert}>convert to invoice</Btn>
+      )}
+      {row.invoiced && <Pill s={s} tone="outline">invoiced</Pill>}
+    </div>
+  );
+}
+
+function QuoteHistory({ api, s, history, onRefresh, setTab, setPendingInvoiceDraft }) {
+  const [error, setError] = useState('');
+  const [busyFile, setBusyFile] = useState(null);
+
+  const setStatus = async (file, status) => {
+    setError('');
+    setBusyFile(file);
+    try {
+      await api.ipc.invoke('quotes:set-status', { file, status });
+      await onRefresh();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyFile(null);
+    }
+  };
+
+  const convert = async (file) => {
+    setError('');
+    setBusyFile(file);
+    try {
+      const draft = await api.ipc.invoke('invoices:draft', { quoteFile: file });
+      setPendingInvoiceDraft(draft);
+      setTab('invoices');
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyFile(null);
+    }
+  };
+
+  if (history.length === 0) return null;
+
+  return (
+    <Panel title="quote history" s={s}>
+      <ErrorBanner error={error} s={s} />
+      {history.map((row) => (
+        <HistoryRow
+          key={row.file}
+          s={s}
+          row={row}
+          busy={busyFile === row.file}
+          onSetStatus={(status) => void setStatus(row.file, status)}
+          onConvert={() => void convert(row.file)}
+        />
+      ))}
+    </Panel>
+  );
+}
+
+export function QuotesTab({ api, s, config, setTab, setPendingInvoiceDraft }) {
   const [draftRef, setDraftRef] = useState(null);
   const [history, setHistory] = useState([]);
 
-  const loadHistory = useCallback(() => {
-    api.ipc.invoke('quotes:list').then(setHistory).catch(() => {});
+  // Sequence guard: history refreshes fire from mount and from every status
+  // action / composer generate; only the most recently *started* refresh is
+  // allowed to land (same idiom as clients.jsx's listSeqRef).
+  const historySeqRef = useRef(0);
+  const loadHistory = useCallback(async () => {
+    const seq = ++historySeqRef.current;
+    try {
+      const list = await api.ipc.invoke('quotes:list');
+      if (seq !== historySeqRef.current) return; // a newer refresh has since started; drop this stale result
+      setHistory(list);
+    } catch {
+      // history is best-effort here; per-action errors surface in QuoteHistory's own banner
+    }
   }, [api]);
-  useEffect(loadHistory, [loadHistory]);
+  useEffect(() => {
+    void loadHistory();
+  }, [loadHistory]);
 
   if (draftRef) {
     return (
@@ -255,7 +351,7 @@ export function QuotesTab({ api, s, config }) {
         onBack={() => setDraftRef(null)}
         onDone={() => {
           setDraftRef(null);
-          loadHistory();
+          void loadHistory();
         }}
       />
     );
@@ -263,17 +359,7 @@ export function QuotesTab({ api, s, config }) {
   return (
     <>
       <WorkItems api={api} s={s} onQuote={setDraftRef} />
-      {history.length > 0 && (
-        <Panel title="quote history" s={s}>
-          {history.map((h) => (
-            <div key={h.file} style={{ display: 'flex', gap: 10, padding: '6px 0', borderTop: `1px solid ${s.hairline}`, fontSize: 12 }}>
-              <span style={{ flex: 1, color: s.ink0 }}>{h.client}{h.project ? ` — ${h.project}` : ''}</span>
-              <span style={{ fontFamily: 'ui-monospace, monospace', color: s.ink1 }}>{formatMoney(h.total, h.currency || 'EUR')}</span>
-              <span style={{ fontFamily: 'ui-monospace, monospace', color: s.ink2 }}>{h.generated.slice(0, 10)}</span>
-            </div>
-          ))}
-        </Panel>
-      )}
+      <QuoteHistory api={api} s={s} history={history} onRefresh={loadHistory} setTab={setTab} setPendingInvoiceDraft={setPendingInvoiceDraft} />
     </>
   );
 }
