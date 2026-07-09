@@ -261,6 +261,14 @@ ${blocks}`,
       }));
   }
 
+  // serialize so concurrent generates can't mint the same invoice number
+  let generateChain = Promise.resolve();
+  const serialized = (fn) => (...args) => {
+    const run = generateChain.then(() => fn(...args));
+    generateChain = run.catch(() => {});
+    return run;
+  };
+
   async function rewriteStatus(dir, file, status, table, extraFields = {}) {
     if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
       throw new Error('file must be a note basename');
@@ -489,7 +497,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       return base;
     },
 
-    'invoices:generate': async (invoice) => {
+    'invoices:generate': serialized(async (invoice) => {
       if (!invoice || typeof invoice !== 'object') throw new Error('generate needs an invoice');
       if (!invoice.client || !Array.isArray(invoice.lineItems) || invoice.lineItems.length === 0) {
         throw new Error('invoice needs a client and at least one line item');
@@ -498,6 +506,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       let client = null;
       if (invoice.clientId) {
         client = await findClient(invoice.clientId);
+        if (!client) throw new Error(`unknown client: ${invoice.clientId}`);
       } else {
         const store = await readClients();
         client = resolveClient(store.clients, invoice.client).client;
@@ -547,7 +556,7 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       }
       ctx.log('invoice generated:', path.join(dir, `${base}.pdf`));
       return { pdfPath: path.join(dir, `${base}.pdf`), notePath: path.join(dir, `${base}.md`), number: inv.number };
-    },
+    }),
 
     'invoices:list': async () => {
       let files;

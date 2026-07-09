@@ -301,3 +301,22 @@ test('overdue is computed, never stored', async () => {
   const text = readFileSync(gen.notePath, 'utf-8');
   assert.ok(!text.includes('overdue'));
 });
+
+test('concurrent generates never mint the same invoice number', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  const inv = (n) => ({ ...draft, client: `Client ${n}`, lineItems: [{ description: 'x', hours: 1, rate: 'default' }] });
+  const [a, b] = await Promise.all([
+    w.handlers['invoices:generate'](inv(1)),
+    w.handlers['invoices:generate'](inv(2)),
+  ]);
+  assert.notEqual(a.number, b.number);
+});
+
+test('generate rejects an unknown clientId', async () => {
+  const w = makeWorld();
+  await assert.rejects(
+    w.handlers['invoices:generate']({ client: 'X', clientId: 'nope-123', lineItems: [{ description: 'x', hours: 1, rate: 'default' }] }),
+    /unknown client/,
+  );
+});
