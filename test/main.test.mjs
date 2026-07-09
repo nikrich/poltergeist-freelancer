@@ -485,3 +485,44 @@ test('concurrent quotes:sweep calls join into the same in-flight run, no doubled
   assert.equal(r1, r2, 'both callers must resolve to the exact same result object');
   assert.equal(r1.items.length, 1);
 });
+
+test('a dismiss landing between two sweep batches survives — the dismissed item must not resurrect', async () => {
+  const w = makeWorld({ sweepMaxNotes: 12 });
+  seedNotes(w.vault, 12); // BATCH_SIZE=10 -> batch 1 = 10 notes, batch 2 = 2 notes
+
+  let batch2Started;
+  const batch2Started$ = new Promise((resolve) => { batch2Started = resolve; });
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+
+  // Batch 1 resolves immediately and finds one item; batch 1's cache write
+  // (items + seen mtimes) must land on disk before batch 2 is ever attempted.
+  w.llmResponses.push({
+    items: [{ title: 'Booking portal', client: 'ACME', ask: 'Build a small booking portal', sourceNote: '00-inbox/note-0.md', confidence: 0.9 }],
+  });
+  // Batch 2's llm call is gated: it signals batch2Started() (proving batch 1's
+  // write already happened) then parks until the test releases it.
+  w.llmResponses.push(async () => {
+    batch2Started();
+    await gate;
+    return { items: [] };
+  });
+
+  const sweepPromise = w.handlers['quotes:sweep']({});
+  await batch2Started$;
+
+  const cacheAfterBatch1 = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.equal(cacheAfterBatch1.items.length, 1, 'batch 1 item must already be persisted');
+  const dismissedId = cacheAfterBatch1.items[0].id;
+
+  // A dismiss lands here — between batch 1's write and batch 2's write.
+  await w.handlers['quotes:dismiss'](dismissedId);
+
+  releaseGate();
+  const result = await sweepPromise;
+
+  assert.ok(!result.items.some((i) => i.id === dismissedId), 'dismissed item must not resurrect in the sweep result');
+  const finalCache = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.ok(finalCache.dismissed.includes(dismissedId), 'dismissal must still be recorded after the final batch write');
+  assert.ok(!finalCache.items.some((i) => i.id === dismissedId), 'dismissed item must not reappear in the persisted cache');
+});

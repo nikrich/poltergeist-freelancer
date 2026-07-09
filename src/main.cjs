@@ -322,7 +322,10 @@ ${blocks}`,
             for (const n of batch) scannedMtimes[n.rel] = n.mtimeMs;
             // Write after EACH batch: an interruption (crash, error in a later
             // batch) loses at most the batch in flight, never the whole pass.
-            cache = mergeSweep(cache, { items, scannedMtimes });
+            // Re-read from disk right before merging: a concurrent write (e.g.
+            // quotes:dismiss) landing between batches must not be clobbered by
+            // this batch's stale in-memory snapshot.
+            cache = mergeSweep(await readCache(), { items, scannedMtimes });
             await writeCache(cache);
           }
 
