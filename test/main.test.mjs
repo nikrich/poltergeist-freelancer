@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -8,9 +8,10 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { createHandlers } = require('../src/main.cjs');
 
-function makeWorld() {
+function makeWorld(extraDeps = {}) {
   const root = mkdtempSync(join(tmpdir(), 'freelancer-'));
   const vault = join(root, 'vault');
+  const dataDir = join(root, 'data');
   mkdirSync(join(vault, '00-inbox'), { recursive: true });
   writeFileSync(
     join(vault, '00-inbox', 'mail-acme.md'),
@@ -30,7 +31,7 @@ function makeWorld() {
   const ctx = {
     pluginId: 'freelancer',
     pluginDir: root,
-    dataDir: join(root, 'data'),
+    dataDir,
     settings: { get: (k) => settings.get(k), set: (k, v) => settings.set(k, v) },
     ipc: { handle: () => {}, send: (ch, p) => sent.push([ch, p]) },
     api: {
@@ -40,7 +41,10 @@ function makeWorld() {
         assert.ok(body.jsonSchema);
         const next = llmResponses.shift();
         if (!next) throw new Error('unexpected llm call');
-        return { ok: true, data: { text: '', structured: next, error: null } };
+        // A response entry may be a function (optionally async) returning the
+        // structured payload — lets tests gate/delay a call to test joining.
+        const structured = typeof next === 'function' ? await next() : next;
+        return { ok: true, data: { text: '', structured, error: null } };
       },
     },
     log: () => {},
@@ -53,8 +57,30 @@ function makeWorld() {
       return Buffer.from('%PDF-fake');
     },
     now: () => new Date('2026-07-09T12:00:00Z'),
+    ...extraDeps,
   });
-  return { handlers, llmResponses, sent, pdfCalls, vault, settings };
+  return { handlers, llmResponses, sent, pdfCalls, vault, dataDir, settings };
+}
+
+// Seeds `total` markdown notes in 00-inbox with distinct, controlled mtimes so
+// candidateNotes()'s newest-first ordering is deterministic across the test
+// run. makeWorld() already writes 00-inbox/mail-acme.md; this reuses it as the
+// OLDEST of the set and adds `total - 1` newer notes (note-0 newest).
+function seedNotes(vault, total, baseMs = new Date('2026-07-09T10:00:00Z').getTime()) {
+  const inbox = join(vault, '00-inbox');
+  const files = [];
+  for (let i = 0; i < total - 1; i++) {
+    const name = `note-${i}.md`;
+    const p = join(inbox, name);
+    writeFileSync(p, `# ${name}\n\nSome incoming ask about ${name}.\n`);
+    files.push(p);
+  }
+  files.push(join(inbox, 'mail-acme.md'));
+  files.forEach((p, idx) => {
+    const t = new Date(baseMs - idx * 60000);
+    utimesSync(p, t, t);
+  });
+  return files;
 }
 
 test('sweep finds the seeded work request and caches it', async () => {
@@ -399,4 +425,104 @@ test('finding 3: pdf carries the collision-resolved invoice number, not the pre-
   const html = w.pdfCalls[w.pdfCalls.length - 1];
   assert.ok(html.includes(second.number), `pdf html should contain final number ${second.number}`);
   assert.ok(!html.includes(first.number), `pdf html should not contain pre-collision number ${first.number}`);
+});
+
+test('sweep caps notes per pass and reports how many are still unswept', async () => {
+  const w = makeWorld({ sweepMaxNotes: 2 });
+  seedNotes(w.vault, 5); // + the default mail-acme.md note from makeWorld = 5 total
+
+  w.llmResponses.push({ items: [] });
+  const first = await w.handlers['quotes:sweep']({});
+  assert.equal(first.scanned, 2);
+  assert.equal(first.remaining, 3);
+  const cache1 = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.equal(Object.keys(cache1.seen).length, 2);
+
+  w.llmResponses.push({ items: [] });
+  const second = await w.handlers['quotes:sweep']({});
+  assert.equal(second.scanned, 2);
+  assert.equal(second.remaining, 1);
+});
+
+test('sweep writes the cache after each batch, so an interrupted pass only loses its own batch', async () => {
+  const w = makeWorld({ sweepMaxNotes: 12 });
+  seedNotes(w.vault, 12); // BATCH_SIZE=10 -> batch 1 = 10 notes, batch 2 = 2 notes
+
+  // Only enough responses for the first batch; the second batch's llm call
+  // (and its retry) find the queue empty and throw.
+  w.llmResponses.push({ items: [] });
+  await assert.rejects(w.handlers['quotes:sweep']({}), /unexpected llm call/);
+
+  const cache = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.equal(Object.keys(cache.seen).length, 10, 'first batch must be persisted even though the pass overall rejected');
+
+  // A fresh sweep, after re-stocking responses, must not re-scan the first 10.
+  w.llmResponses.push({ items: [] });
+  const res = await w.handlers['quotes:sweep']({});
+  assert.equal(res.scanned, 2);
+  assert.equal(res.remaining, 0);
+});
+
+test('concurrent quotes:sweep calls join into the same in-flight run, no doubled llm calls', async () => {
+  const w = makeWorld();
+  let calls = 0;
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  w.llmResponses.push(async () => {
+    calls += 1;
+    await gate;
+    return {
+      items: [{ title: 'Booking portal', client: 'ACME GmbH', ask: 'Build a small booking portal', sourceNote: '00-inbox/mail-acme.md', confidence: 0.9 }],
+    };
+  });
+
+  const p1 = w.handlers['quotes:sweep']({});
+  const p2 = w.handlers['quotes:sweep']({}); // invoked while p1 is parked mid-flight
+  releaseGate();
+  const [r1, r2] = await Promise.all([p1, p2]);
+
+  assert.equal(calls, 1, 'llm must only be called once — the joiner must not re-run the sweep');
+  assert.equal(r1, r2, 'both callers must resolve to the exact same result object');
+  assert.equal(r1.items.length, 1);
+});
+
+test('a dismiss landing between two sweep batches survives — the dismissed item must not resurrect', async () => {
+  const w = makeWorld({ sweepMaxNotes: 12 });
+  seedNotes(w.vault, 12); // BATCH_SIZE=10 -> batch 1 = 10 notes, batch 2 = 2 notes
+
+  let batch2Started;
+  const batch2Started$ = new Promise((resolve) => { batch2Started = resolve; });
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+
+  // Batch 1 resolves immediately and finds one item; batch 1's cache write
+  // (items + seen mtimes) must land on disk before batch 2 is ever attempted.
+  w.llmResponses.push({
+    items: [{ title: 'Booking portal', client: 'ACME', ask: 'Build a small booking portal', sourceNote: '00-inbox/note-0.md', confidence: 0.9 }],
+  });
+  // Batch 2's llm call is gated: it signals batch2Started() (proving batch 1's
+  // write already happened) then parks until the test releases it.
+  w.llmResponses.push(async () => {
+    batch2Started();
+    await gate;
+    return { items: [] };
+  });
+
+  const sweepPromise = w.handlers['quotes:sweep']({});
+  await batch2Started$;
+
+  const cacheAfterBatch1 = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.equal(cacheAfterBatch1.items.length, 1, 'batch 1 item must already be persisted');
+  const dismissedId = cacheAfterBatch1.items[0].id;
+
+  // A dismiss lands here — between batch 1's write and batch 2's write.
+  await w.handlers['quotes:dismiss'](dismissedId);
+
+  releaseGate();
+  const result = await sweepPromise;
+
+  assert.ok(!result.items.some((i) => i.id === dismissedId), 'dismissed item must not resurrect in the sweep result');
+  const finalCache = JSON.parse(readFileSync(join(w.dataDir, 'work-items.json'), 'utf-8'));
+  assert.ok(finalCache.dismissed.includes(dismissedId), 'dismissal must still be recorded after the final batch write');
+  assert.ok(!finalCache.items.some((i) => i.id === dismissedId), 'dismissed item must not reappear in the persisted cache');
 });

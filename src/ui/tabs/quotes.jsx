@@ -11,6 +11,7 @@ function WorkItems({ api, s, onQuote }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(null);
   const [error, setError] = useState('');
+  const [remaining, setRemaining] = useState(0);
 
   const sweep = useCallback(async (force) => {
     setBusy(true);
@@ -18,6 +19,7 @@ function WorkItems({ api, s, onQuote }) {
     try {
       const res = await api.ipc.invoke('quotes:sweep', { force });
       setItems(res.items);
+      setRemaining(res.remaining ?? 0);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -56,6 +58,11 @@ function WorkItems({ api, s, onQuote }) {
         }
       >
         <ErrorBanner error={error} s={s} />
+        {remaining > 0 && (
+          <div style={{ fontSize: 11, color: s.ink2, marginBottom: 8 }}>
+            {remaining.toLocaleString()} older notes not swept yet — sweep again to continue
+          </div>
+        )}
         {items.length === 0 && !busy && (
           <div style={{ fontSize: 12, color: s.ink2 }}>no open work requests found — sweep again after new mail lands, or pick a note below.</div>
         )}

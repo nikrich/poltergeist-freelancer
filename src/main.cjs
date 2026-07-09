@@ -23,6 +23,7 @@ const {
 const SWEEP_WINDOW_DAYS = 14;
 const EXCERPT_CHARS = 2000;
 const BATCH_SIZE = 10;
+const SWEEP_MAX_NOTES = 100;
 
 const DEFAULT_CONFIG = {
   vaultPath: '~/ghostbrain/vault',
@@ -112,6 +113,7 @@ async function renderPdfElectron(html) {
 function createHandlers(ctx, deps = {}) {
   const renderPdf = deps.renderPdf ?? renderPdfElectron;
   const now = deps.now ?? (() => new Date());
+  const sweepMaxNotes = deps.sweepMaxNotes ?? SWEEP_MAX_NOTES;
   const cachePath = path.join(ctx.dataDir, 'work-items.json');
   const clientsPath = path.join(ctx.dataDir, 'clients.json');
 
@@ -289,29 +291,51 @@ ${blocks}`,
     return { ok: true, status };
   }
 
+  // A sweep in progress here; joiners get the SAME promise instead of
+  // starting a second pass (a tab remount must never re-run the LLM calls).
+  let sweepInFlight = null;
+
   const handlers = {
     'quotes:set-status': async ({ file, status } = {}) => rewriteStatus(quotesDir(), file, status, QUOTE_TRANSITIONS),
 
     'quotes:sweep': async (opts = {}) => {
-      const cache = await readCache();
-      const notes = await candidateNotes();
-      const fresh = notes.filter((n) => opts.force || cache.seen[n.rel] !== n.mtimeMs);
+      if (sweepInFlight) return sweepInFlight;
+      const run = (async () => {
+        try {
+          let cache = await readCache();
+          const notes = await candidateNotes();
+          const unseen = notes.filter((n) => opts.force || cache.seen[n.rel] !== n.mtimeMs);
+          // Cap per call so a huge vault can't turn one sweep into hundreds of
+          // sequential LLM calls; the UI surfaces `remaining` so the user can
+          // just sweep again to keep working through the backlog.
+          const fresh = unseen.slice(0, sweepMaxNotes);
+          const remaining = unseen.length - fresh.length;
 
-      const scannedMtimes = {};
-      const found = [];
-      for (let i = 0; i < fresh.length; i += BATCH_SIZE) {
-        const batch = fresh.slice(i, i + BATCH_SIZE);
-        for (const n of batch) {
-          n.excerpt = (await fsp.readFile(n.path, 'utf-8').catch(() => '')).slice(0, EXCERPT_CHARS);
-          scannedMtimes[n.rel] = n.mtimeMs;
+          for (let i = 0; i < fresh.length; i += BATCH_SIZE) {
+            const batch = fresh.slice(i, i + BATCH_SIZE);
+            for (const n of batch) {
+              n.excerpt = (await fsp.readFile(n.path, 'utf-8').catch(() => '')).slice(0, EXCERPT_CHARS);
+            }
+            ctx.ipc.send('quotes:sweep-progress', { done: Math.min(i + BATCH_SIZE, fresh.length), total: fresh.length });
+            const items = batch.length ? await extractItems(batch) : [];
+            const scannedMtimes = {};
+            for (const n of batch) scannedMtimes[n.rel] = n.mtimeMs;
+            // Write after EACH batch: an interruption (crash, error in a later
+            // batch) loses at most the batch in flight, never the whole pass.
+            // Re-read from disk right before merging: a concurrent write (e.g.
+            // quotes:dismiss) landing between batches must not be clobbered by
+            // this batch's stale in-memory snapshot.
+            cache = mergeSweep(await readCache(), { items, scannedMtimes });
+            await writeCache(cache);
+          }
+
+          return { items: cache.items, sweptAt: now().toISOString(), scanned: fresh.length, remaining };
+        } finally {
+          sweepInFlight = null;
         }
-        ctx.ipc.send('quotes:sweep-progress', { done: Math.min(i + BATCH_SIZE, fresh.length), total: fresh.length });
-        if (batch.length) found.push(...(await extractItems(batch)));
-      }
-
-      const next = mergeSweep(cache, { items: found, scannedMtimes });
-      await writeCache(next);
-      return { items: next.items, sweptAt: now().toISOString(), scanned: fresh.length };
+      })();
+      sweepInFlight = run;
+      return run;
     },
 
     'quotes:dismiss': async (id) => {
