@@ -1,6 +1,6 @@
 // Real printToPDF smoke — run with an electron binary, not plain node:
 //   npx electron test/pdf.electron.mjs   (or the host app's electron)
-// Asserts the branded template renders to a real PDF buffer.
+// Asserts the branded quote and invoice templates render to real PDF buffers.
 
 import { app, BrowserWindow } from 'electron';
 import { createRequire } from 'node:module';
@@ -8,9 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
 const require = createRequire(import.meta.url);
-const { renderQuoteHtml } = require(resolve(fileURLToPath(import.meta.url), '../../src/lib/template.cjs'));
+const { renderQuoteHtml, renderInvoiceHtml } = require(resolve(fileURLToPath(import.meta.url), '../../src/lib/template.cjs'));
 
-const html = renderQuoteHtml(
+const quoteHtml = renderQuoteHtml(
   {
     client: 'ACME GmbH',
     project: 'Booking portal',
@@ -22,14 +22,39 @@ const html = renderQuoteHtml(
   { currency: 'EUR', default: 80, named: [{ name: 'development', hourly: 95 }] },
 );
 
-app.whenReady().then(async () => {
+const invoiceHtml = renderInvoiceHtml(
+  {
+    number: 'INV-2026-001',
+    client: 'Acme',
+    issued: '2026-07-09',
+    due: '2026-07-23',
+    lineItems: [{ description: 'dev', hours: 2, rate: 'default' }],
+    vatRate: 15,
+  },
+  { businessName: 'Richter Digital', accentColor: '#C5FF3D', paymentTerms: 'net 14' },
+  { currency: 'EUR', default: 80, named: [] },
+);
+
+async function renderPdf(html) {
   const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true, javascript: false } });
+  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  return win.webContents.printToPDF({ pageSize: 'A4', printBackground: true });
+}
+
+function assertPdf(pdf, label) {
+  if (!pdf.subarray(0, 4).toString().startsWith('%PDF')) throw new Error(`${label}: not a PDF`);
+  if (pdf.length < 5000) throw new Error(`${label}: suspiciously small PDF: ${pdf.length}B`);
+  console.log(`${label} PDF OK: ${pdf.length} bytes`);
+}
+
+app.whenReady().then(async () => {
   try {
-    await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-    const pdf = await win.webContents.printToPDF({ pageSize: 'A4', printBackground: true });
-    if (!pdf.subarray(0, 4).toString().startsWith('%PDF')) throw new Error('not a PDF');
-    if (pdf.length < 5000) throw new Error(`suspiciously small PDF: ${pdf.length}B`);
-    console.log(`PDF OK: ${pdf.length} bytes`);
+    const quotePdf = await renderPdf(quoteHtml);
+    assertPdf(quotePdf, 'quote');
+
+    const invoicePdf = await renderPdf(invoiceHtml);
+    assertPdf(invoicePdf, 'invoice');
+
     app.exit(0);
   } catch (err) {
     console.error('PDF smoke failed:', err.message);
