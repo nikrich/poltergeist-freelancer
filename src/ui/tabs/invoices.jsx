@@ -87,7 +87,7 @@ function NewInvoiceMenu({ s, acceptedQuotes, clients, onPick }) {
   );
 }
 
-function InvoiceRow({ s, row, busy, onSetStatus }) {
+function InvoiceRow({ s, row, busy, onSetStatus, onOpen }) {
   const overdue = !!row.overdue;
   return (
     <div
@@ -110,6 +110,10 @@ function InvoiceRow({ s, row, busy, onSetStatus }) {
       <span style={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, color: overdue ? s.oxblood : s.ink2, width: 120, textAlign: 'right', flexShrink: 0 }}>
         {overdue ? `${row.daysOverdue}d overdue` : `due ${row.due}`}
       </span>
+      {row.pdf && (
+        <Btn s={s} disabled={busy} onClick={() => onOpen('pdf')}>pdf</Btn>
+      )}
+      <Btn s={s} disabled={busy} onClick={() => onOpen('note')}>note</Btn>
       <StatusPill s={s} status={overdue ? 'overdue' : row.status} />
       {row.status === 'draft' && (
         <Btn s={s} disabled={busy} onClick={() => onSetStatus('sent')}>mark sent</Btn>
@@ -300,6 +304,18 @@ export function InvoicesTab({ api, s, config, pendingInvoiceDraft, setPendingInv
     }
   };
 
+  const open = async (file, which) => {
+    setError('');
+    setBusyFile(file);
+    try {
+      await api.ipc.invoke('invoices:open', { file, which });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyFile(null);
+    }
+  };
+
   if (draft) {
     return (
       <Composer
@@ -341,6 +357,7 @@ export function InvoicesTab({ api, s, config, pendingInvoiceDraft, setPendingInv
           row={row}
           busy={busyFile === row.file}
           onSetStatus={(status) => void setStatus(row.file, status)}
+          onOpen={(which) => void open(row.file, which)}
         />
       ))}
     </Panel>

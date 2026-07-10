@@ -726,6 +726,22 @@ Return {"client", "project", "scopeSummary", "lineItems": [{"description", "hour
       return rewriteStatus(invoicesDir(), file, status, INVOICE_TRANSITIONS, extra);
     },
 
+    // Open an invoice's note or pdf sibling by basename — same guard idiom as
+    // quotes:open (basename-only, must resolve inside invoicesDir).
+    'invoices:open': async ({ file, which } = {}) => {
+      if (typeof file !== 'string' || file !== path.basename(file) || !file.endsWith('.md')) {
+        throw new Error('file must be a note basename');
+      }
+      if (which !== 'pdf' && which !== 'note') {
+        throw new Error("which must be 'pdf' or 'note'");
+      }
+      const target = which === 'pdf' ? file.replace(/\.md$/, '.pdf') : file;
+      const full = assertInside(invoicesDir(), path.join(invoicesDir(), target));
+      const err = await openPath(full);
+      if (err) throw new Error(err);
+      return { ok: true };
+    },
+
     /* ---------- clients CRM ---------- */
 
     'clients:list': async (opts = {}) => {

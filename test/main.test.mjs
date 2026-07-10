@@ -363,6 +363,35 @@ test('generate rejects an unknown clientId', async () => {
   );
 });
 
+test('invoices:open resolves pdf/note siblings inside invoicesDir and rejects basename traversal', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  const gen = await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+  });
+  const file = gen.notePath.split('/').pop();
+
+  await w.handlers['invoices:open']({ file, which: 'note' });
+  assert.equal(w.openCalls[0], gen.notePath);
+
+  await w.handlers['invoices:open']({ file, which: 'pdf' });
+  assert.equal(w.openCalls[1], gen.notePath.replace(/\.md$/, '.pdf'));
+
+  await assert.rejects(w.handlers['invoices:open']({ file: '../../evil.md', which: 'note' }), /basename|invalid/i);
+});
+
+test('invoices:open rejects an unrecognized which value instead of silently opening the note', async () => {
+  const w = makeWorld();
+  const draft = await w.handlers['invoices:draft']({});
+  const gen = await w.handlers['invoices:generate']({
+    ...draft, client: 'Acme', lineItems: [{ description: 'x', hours: 1, rate: 'default' }],
+  });
+  const file = gen.notePath.split('/').pop();
+
+  await assert.rejects(w.handlers['invoices:open']({ file, which: 'exe' }), /which must be/i);
+  assert.equal(w.openCalls.length, 0);
+});
+
 test('dashboard aggregates statuses, revenue, attention and activity', async () => {
   const w = makeWorld();
   const q = await generateQuote(w);
